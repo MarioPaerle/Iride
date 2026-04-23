@@ -45,6 +45,14 @@ python iride.py attention \                # attention head analysis
 python iride.py residual-contrib \         # what each block contributes
   --script model.py --model-class GPT \
   --weights model.pt --input-shape 1,8,128
+
+python iride.py mlp-usage \                # per-neuron MLP usage stats
+  --script model.py --model-class GPT \
+  --weights model.pt --input-shape 1,8,128
+
+python iride.py mlp-usage-plot \           # HTML heatmap of MLP usage
+  --script model.py --model-class GPT \
+  --weights model.pt --input-shape 1,8,128
 ```
 
 `python iride.py --help` for everything.  
@@ -70,6 +78,8 @@ TRANSFORMER ANALYSIS              requires forward pass
   residual-stream norm growth, cosine drift, dead layers
   attention       per-head entropy, diagonality, verticality, patterns
   attention-plot  html heatmap with optional hf tokenizer labels
+  mlp-usage       per-neuron usage: dead / super / gini / contribution
+  mlp-usage-plot  html heatmap, one row per mlp layer, one cell per neuron
   run-forward     per-layer activation stats, nan/inf tracing
 
 INTERPRETIVE ANALYSIS             what the model is trying to do
@@ -150,6 +160,101 @@ commands, decision trees, causal masking rules, error handling,
 and an interpretive analysis guide that teaches the agent  
 how to read scalar parameters, residual contributions,  
 and block-level trends -- not just numbers, but meaning.
+
+---
+
+## mlp usage pack
+
+Transformer FFN layers behave as key-value memories
+(Geva et al. 2020, Lample et al. 2019). Each column `j` of `W_up`
+is a "key" matched against `X`; each column `j` of `W_down` is the
+"value" it writes to the residual stream.
+
+Iride's `mlp-usage` pack measures, on a forward pass, how often
+each key fires, how strongly it fires, and how much the matching
+value actually moves the output. Dead columns = wasted capacity.
+Superneurons that fire for every token = candidates for a shared
+prefix cache across layers. The long tail = layer-specific
+specialists.
+
+### what is measured, per column
+
+- `activation_fraction`: P(|h_j| > threshold). Zero ≈ dead, one ≈ superneuron.
+- `post_mean`: E[h_j] after activation.
+- `contribution`: E[|h_j|] · ||W_down[:, j]||₂. The honest metric: a
+  neuron that fires a lot but has a near-zero downstream column moves
+  nothing. Contribution captures the actual effect on the output.
+- `gini`: how unequal the usage is across neurons, in [0, 1].
+- `normalized_usage_entropy`: 1.0 = flat usage, < 0.5 = peaked on few neurons.
+- `top_neurons` / `bottom_neurons`: most / least useful columns by contribution.
+
+### json output (`mlp-usage`)
+
+```bash
+python iride.py mlp-usage \
+  --script model.py --model-class GPT \
+  --weights model.pt --input-shape 4,512 \
+  --activation relu2
+```
+
+Returns per-layer stats plus a global summary (total dead neurons,
+super neurons, average gini). Use `--text "..." --tokenizer gpt2`
+for token-aware measurement on realistic inputs.
+
+### html heatmap (`mlp-usage-plot`)
+
+```bash
+python iride.py mlp-usage-plot \
+  --script model.py --model-class GPT \
+  --weights model.pt --text "The cat sat on" --tokenizer gpt2 \
+  --metric contribution --sort-by index
+```
+
+Produces `mlp_usage_<metric>_<sort-by>.html` next to the checkpoint.
+One row per MLP layer, one cell per memory neuron. Dark blue = dead,
+cyan = moderate, red = heavily used. Hover any cell to see the raw value.
+
+Two reading modes:
+
+- `--sort-by index` keeps the original column order. Reveals spatial
+  structure: shared-prefix clustering near column 0, dead tails,
+  periodic patterns, or per-block usage bands in parameter-banked models.
+- `--sort-by metric` sorts each row descending. Reveals the head/tail
+  distribution and lets you compare how peaked each layer is.
+
+Three metric modes:
+
+- `--metric fraction`     how often the neuron fires
+- `--metric magnitude`    how strongly it fires
+- `--metric contribution` how much it moves the output (default, most honest)
+
+### flags
+
+- `--activation relu2 | relu | gelu | silu | leakyrelu2 | identity`
+  applied to the captured up-projection output. Pass `identity` if
+  your hook captures already-activated values (fused MLP modules).
+- `--mlp-pattern '<regex>'` overrides auto-detection. Use when your
+  up-projections don't match the standard keyword set (e.g. banked
+  parameters, custom names). Run `tree` first to find the right names.
+- `--expansion-threshold` (default 1.5): minimum `out/in` ratio to
+  auto-classify a Linear as an MLP up-projection. Lower it if your
+  MLP uses no expansion or a small one.
+- `--no-w-down` reports raw post-activation magnitudes instead of
+  output contributions. Use when W_down is tied, banked, or simply
+  absent from the checkpoint.
+- `--max-cols N` (plot only, default 1024): cells per row before
+  stride-sampling. Raise it to see every neuron in wide MLPs.
+
+### when to use what
+
+| Question | Command |
+|---|---|
+| Any dead neurons? how many? | `mlp-usage` → `dead_pct_global` |
+| Is a layer using its capacity well? | `mlp-usage` → `gini`, `normalized_usage_entropy` |
+| Which neurons actually matter? | `mlp-usage` → `top_neurons` per layer |
+| Visual structure across all layers at once | `mlp-usage-plot --sort-by index` |
+| How peaked is each layer? | `mlp-usage-plot --sort-by metric` |
+| Any super-generic shared neurons? | `mlp-usage` → `super_count`, then plot with `--metric fraction` |
 
 ---
 

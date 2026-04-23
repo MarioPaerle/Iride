@@ -21,6 +21,8 @@ Workflow:
   and `residual-contrib` to measure actual block contributions during a forward pass.
   Read the "Interpretive Analysis Guide" section before using these.
 - For transformer models: use `attention` and `residual-stream` for dynamic analysis.
+- For MLP memory usage (dead neurons, superneurons, per-column contribution):
+  use `mlp-usage` for JSON stats or `mlp-usage-plot` for an HTML heatmap across all layers.
 - Use `run-forward` as a last resort if weights look fine but inference still fails.
 - Composable primitives (`slice`, `topk`, `cosine`, `reduce`, `matmul`) can be chained for custom analysis but cost more tokens. Only use them when the high-level commands don't answer your question.
 
@@ -183,6 +185,74 @@ Captures activation statistics from every layer during a forward pass. Use when 
     python iride.py run-forward \
       --script model.py --model-class SimpleMLP \
       --weights checkpoint.pt --input-shape 1,128
+
+
+13a. MLP Column Usage (mlp-usage)
+
+Treats every column of W_up as a "memory neuron" (Geva 2020: FFN layers as key-value memories). For each MLP, runs a forward pass, hooks the up-projection, applies the activation, and reports per-column usage stats.
+
+    python iride.py mlp-usage \
+      --script model.py --model-class GPT \
+      --weights model.pt --input-shape 4,512
+
+    python iride.py mlp-usage \
+      --script model.py --model-class GPT \
+      --weights model.pt --text "The cat sat on" --tokenizer gpt2 \
+      --activation relu2
+
+Per-column metrics returned (as summary stats + top/bottom lists, never raw arrays):
+- activation_fraction: P(|h_j| > threshold). Near zero = dead neuron. Near one = superneuron.
+- post_mean: E[h_j] after activation. Magnitude of typical firing.
+- contribution: E[|h_j|] * ||W_down[:, j]||. The honest "impact on output" metric. A neuron
+  that fires loudly but whose W_down column is near-zero moves nothing.
+- dead_count / super_count: based on activation_fraction thresholds (0.01 and 0.95).
+- gini in [0, 1]: 0 = every neuron carries equal load, 1 = all load on one neuron.
+- normalized_usage_entropy: 1.0 = flat use, <0.5 = sharply peaked.
+- top_neurons / bottom_neurons: indices sorted by contribution.
+
+Auto-detects MLP up-projections by: (a) module name keywords (fc1, c_fc, w_up, up_proj,
+gate_proj, intermediate, ...) AND/OR (b) shape (out >= in * expansion_threshold).
+Attention-like names (q_proj, kv, c_attn, ...) are excluded.
+
+Override auto-detection with --mlp-pattern '<regex>' (run `tree` first to find module names).
+
+Activation choices: relu2 (default), relu, gelu, silu, leakyrelu2, identity.
+Use --activation identity when the hook captures already-activated values (fused MLP blocks).
+
+--no-w-down disables the W_down weighting; contribution becomes just E[|h_j|].
+
+Agent workflow: use mlp-usage to detect (a) wasted capacity from dead columns, (b) over-shared
+generic neurons via super_count (candidates for a shared-prefix cache across layers), and
+(c) which specific columns drive the output via top_neurons. High gini with low dead_count
+means the layer has found specialists; low gini across the board means undifferentiated usage.
+
+
+13b. MLP Usage Heatmap (mlp-usage-plot)
+
+Same analysis as mlp-usage but renders an HTML heatmap (one row per MLP layer, one cell
+per memory neuron). Dark blue = dead, cyan = moderate, red = heavily used. The visual analog
+of `attention-plot` but for MLP memory.
+
+    python iride.py mlp-usage-plot \
+      --script model.py --model-class GPT \
+      --weights model.pt --text "The cat sat on" --tokenizer gpt2 \
+      --metric contribution --sort-by index
+
+Metric choices:
+- contribution (default): E[|h_j|] * ||W_down[:, j]||
+- magnitude: E[|h_j|] post-activation
+- fraction: P(|h_j| > threshold)
+
+Sort choices:
+- index (default): keep original column order; reveals spatial structure (shared-prefix
+  clustering near column 0, dead tails, periodic patterns, per-bank bands).
+- metric: sort each row descending; reveals the head/tail distribution.
+
+--max-cols N (default 1024) caps cells per row; larger rows are stride-sampled.
+
+Output: mlp_usage_<metric>_<sort-by>.html written next to the checkpoint. The JSON response
+includes per_layer_summary (dead_count, super_count, gini, entropy, top_5_neurons) so the
+agent can reason without opening the HTML.
 
 
 ---

@@ -1375,6 +1375,607 @@ def cmd_attention_plot(args):
     })
 
 
+# --- MLP USAGE ANALYSIS ---
+#
+# Treats each column of W_up as a "memory neuron" (Geva 2020: FF layers as KV
+# memories). For every MLP we run a forward pass, capture the up-projection's
+# pre-activation output, apply the activation (ReLU^2, GELU, ...), and report
+# per-column usage stats: activation fraction, mean post-activation magnitude,
+# and "true" output contribution = E[h_j] * ||W_down[:, j]||_2.
+#
+# Rationale: the per-column mean of the PRE-activation is a DC offset, not a
+# usage measure. We need post-activation stats, and if we can find the matching
+# W_down we weight by its column norm so we measure how much each neuron
+# actually moves the output.
+
+_MLP_ACTIVATIONS = {
+    "relu2": lambda x: torch.relu(x) ** 2,
+    "relu": torch.relu,
+    "gelu": lambda x: torch.nn.functional.gelu(x),
+    "silu": lambda x: torch.nn.functional.silu(x),
+    "leakyrelu2": lambda x: torch.nn.functional.leaky_relu(x, 0.5) ** 2,
+    "identity": lambda x: x,
+}
+
+_MLP_UP_KEYWORDS = [
+    "mlp_up", "up_proj", "w_up", "w_in", "fc_in", "fc1", "c_fc",
+    "gate_proj", "dense_h_to_4h", "mlp.0", "ffn.up", "intermediate",
+]
+_MLP_DOWN_KEYWORDS = [
+    "down", "w_out", "fc2", "c_proj", "w_down", "down_proj",
+    "dense_4h_to_h", "mlp.1", "ffn.down",
+]
+_ATTN_NAME_KEYWORDS = [
+    "attn", "attention", "self_attn", "query", "key", "value", "qkv",
+    "q_proj", "k_proj", "v_proj", "o_proj", "c_attn",
+]
+
+
+def _apply_mlp_activation(x, name):
+    fn = _MLP_ACTIVATIONS.get(name)
+    if fn is None:
+        emit_error("UnknownActivation",
+                   f"Activation '{name}' not recognized.",
+                   f"Use one of: {', '.join(_MLP_ACTIVATIONS.keys())}")
+    return fn(x)
+
+
+def _is_attention_module_name(name):
+    lower = name.lower()
+    return any(k in lower for k in _ATTN_NAME_KEYWORDS)
+
+
+def _is_mlp_up_by_name(name):
+    lower = name.lower()
+    if any(k in lower for k in ["fc2", "c_proj", "down_proj", "w_down", "dense_4h_to_h"]):
+        return False
+    return any(kw in lower for kw in _MLP_UP_KEYWORDS)
+
+
+def _find_mlp_up_modules(model, expansion_threshold=1.5, name_pattern=None):
+    """
+    Return [(name, module, in_features, out_features), ...] for every module
+    that looks like an MLP up-projection.
+
+    Pattern mode (name_pattern != None): strict regex match, no other filters.
+    Auto mode: requires a 2-D `weight` attribute, excludes attention-looking
+    names, accepts if either the name matches an MLP-up keyword or the shape
+    shows expansion (out >= in * expansion_threshold).
+    """
+    found = []
+    compiled = re.compile(name_pattern) if name_pattern else None
+
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        w = getattr(module, "weight", None)
+        if not isinstance(w, torch.Tensor) or w.dim() != 2:
+            continue
+        out_features, in_features = w.shape[0], w.shape[1]
+
+        if compiled is not None:
+            if compiled.search(name):
+                found.append((name, module, in_features, out_features))
+            continue
+
+        if _is_attention_module_name(name):
+            continue
+
+        name_match = _is_mlp_up_by_name(name)
+        shape_match = out_features >= in_features * expansion_threshold
+
+        if name_match and out_features < in_features:
+            # Name says "up" but shape is compressing -- likely a false positive.
+            continue
+        if name_match or shape_match:
+            found.append((name, module, in_features, out_features))
+
+    return found
+
+
+def _find_matching_w_down(model, up_name, up_out_features):
+    """
+    Given an up-projection name and its out_features, find the best matching
+    down-projection (Linear whose in_features == up_out_features) living in the
+    same parent scope. Returns (name, module, weight) or None.
+    """
+    parent = up_name.rsplit(".", 1)[0] if "." in up_name else ""
+    candidates = []
+    for name, module in model.named_modules():
+        if not name or name == up_name:
+            continue
+        if parent and not name.startswith(parent):
+            continue
+        w = getattr(module, "weight", None)
+        if not isinstance(w, torch.Tensor) or w.dim() != 2:
+            continue
+        if w.shape[1] != up_out_features:
+            continue
+        lower = name.lower()
+        score = sum(1 for k in _MLP_DOWN_KEYWORDS if k in lower)
+        candidates.append((score, name, module, w))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (-c[0], len(c[1])))
+    _, name, module, w = candidates[0]
+    return name, module, w
+
+
+def _mlp_column_stats(pre_activation, w_down_col_norms, activation_name, act_threshold):
+    """
+    Per-column MLP usage statistics.
+
+    pre_activation: [..., m] tensor (output of W_up, PRE activation).
+    w_down_col_norms: [m] L2 norms of W_down columns, or None.
+    Returns a dict with per-column tensors and summary scalars.
+    """
+    if pre_activation.dim() > 2:
+        pre = pre_activation.reshape(-1, pre_activation.shape[-1])
+    else:
+        pre = pre_activation
+    N, m = pre.shape
+
+    post = _apply_mlp_activation(pre, activation_name)
+
+    activation_fraction = (post.abs() > act_threshold).float().mean(dim=0)
+    post_mean = post.mean(dim=0)
+    post_var = post.var(dim=0) if N > 1 else torch.zeros_like(post_mean)
+    pre_mean = pre.mean(dim=0)
+    pre_std = pre.std(dim=0) if N > 1 else torch.zeros_like(pre_mean)
+
+    if w_down_col_norms is not None:
+        contribution = post_mean.abs() * w_down_col_norms
+        w_down_used = True
+    else:
+        contribution = post_mean.abs().clone()
+        w_down_used = False
+
+    dead_count = int((activation_fraction < 0.01).sum().item())
+    super_count = int((activation_fraction > 0.95).sum().item())
+
+    energy = post_mean.abs() + 1e-12
+    p = energy / energy.sum()
+    usage_entropy = -(p * torch.log(p + 1e-12)).sum().item()
+    max_entropy = math.log(m) if m > 1 else 1.0
+    normalized_entropy = usage_entropy / max_entropy
+
+    # Gini over the post-activation energy distribution across columns.
+    sorted_energy, _ = torch.sort(energy)
+    cum = torch.cumsum(sorted_energy, dim=0)
+    total = cum[-1].clamp(min=1e-12)
+    lorenz_area = (cum / total).sum().item() / m
+    gini = 1.0 - 2.0 * lorenz_area + 1.0 / m
+
+    k = min(10, m)
+    top_vals, top_idx = torch.topk(contribution, k)
+    bot_vals, bot_idx = torch.topk(contribution, k, largest=False)
+
+    return {
+        "m": m,
+        "n_tokens": N,
+        "activation": activation_name,
+        "w_down_used": w_down_used,
+        "activation_fraction": activation_fraction,
+        "post_mean": post_mean,
+        "post_var": post_var,
+        "pre_mean": pre_mean,
+        "pre_std": pre_std,
+        "contribution": contribution,
+        "dead_count": dead_count,
+        "super_count": super_count,
+        "dead_pct": round(dead_count / m * 100, 2),
+        "super_pct": round(super_count / m * 100, 2),
+        "usage_entropy": round(usage_entropy, 4),
+        "normalized_usage_entropy": round(normalized_entropy, 4),
+        "gini": round(gini, 4),
+        "top_neurons": [
+            {"index": int(top_idx[i].item()), "contribution": round(top_vals[i].item(), 6)}
+            for i in range(k)
+        ],
+        "bottom_neurons": [
+            {"index": int(bot_idx[i].item()), "contribution": round(bot_vals[i].item(), 6)}
+            for i in range(k)
+        ],
+        "activation_fraction_summary": {
+            "mean": round(activation_fraction.mean().item(), 4),
+            "min": round(activation_fraction.min().item(), 4),
+            "max": round(activation_fraction.max().item(), 4),
+            "std": round(activation_fraction.std().item(), 4) if m > 1 else 0.0,
+        },
+        "contribution_summary": {
+            "mean": round(contribution.mean().item(), 6),
+            "min": round(contribution.min().item(), 6),
+            "max": round(contribution.max().item(), 6),
+            "std": round(contribution.std().item(), 6) if m > 1 else 0.0,
+        },
+    }
+
+
+def cmd_mlp_usage(args):
+    model, input_tensor, tokens, is_causal = _load_model_for_analysis(args)
+
+    mlp_modules = _find_mlp_up_modules(
+        model,
+        expansion_threshold=args.expansion_threshold,
+        name_pattern=args.mlp_pattern,
+    )
+    if not mlp_modules:
+        emit_error(
+            "NoMLPsFound",
+            "Could not find any MLP up-projection modules.",
+            "Pass --mlp-pattern '<regex>' to specify which modules to analyze "
+            "(run 'tree' first to see all module names), or lower "
+            "--expansion-threshold if your MLP uses a small expansion ratio."
+        )
+
+    captured = {}
+
+    def make_hook(name):
+        def hook(module, inp, output):
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+            if isinstance(output, torch.Tensor) and output.dim() >= 2:
+                captured[name] = output.detach().cpu().float()
+        return hook
+
+    handles = []
+    for name, module, _, _ in mlp_modules:
+        handles.append(module.register_forward_hook(make_hook(name)))
+
+    with torch.no_grad():
+        _run_forward_safe(model, input_tensor)
+
+    for h in handles:
+        h.remove()
+
+    if not captured:
+        emit_error(
+            "NoMLPCaptured",
+            "Detected MLP modules but captured no outputs during the forward pass.",
+            "The forward pass may have failed silently. Try 'run-forward' to debug."
+        )
+
+    per_layer = {}
+    layer_order = []
+    for name, module, in_f, out_f in mlp_modules:
+        if name not in captured:
+            continue
+        pre_act = captured[name]
+
+        w_down_info = _find_matching_w_down(model, name, out_f) if args.use_w_down else None
+        if w_down_info is not None:
+            down_name, _, w_down_tensor = w_down_info
+            w_down_col_norms = w_down_tensor.detach().cpu().float().norm(dim=0)
+        else:
+            down_name = None
+            w_down_col_norms = None
+
+        stats = _mlp_column_stats(
+            pre_act,
+            w_down_col_norms,
+            args.activation,
+            args.act_threshold,
+        )
+
+        per_layer[name] = {
+            "up_module": name,
+            "down_module": down_name,
+            "w_down_used": stats["w_down_used"],
+            "shape": list(pre_act.shape),
+            "in_features": in_f,
+            "out_features": out_f,
+            "n_tokens_seen": stats["n_tokens"],
+            "dead_count": stats["dead_count"],
+            "dead_pct": stats["dead_pct"],
+            "super_count": stats["super_count"],
+            "super_pct": stats["super_pct"],
+            "normalized_usage_entropy": stats["normalized_usage_entropy"],
+            "gini": stats["gini"],
+            "activation_fraction_summary": stats["activation_fraction_summary"],
+            "contribution_summary": stats["contribution_summary"],
+            "top_neurons": stats["top_neurons"],
+            "bottom_neurons": stats["bottom_neurons"],
+        }
+        layer_order.append(name)
+
+    total_dead = sum(pl["dead_count"] for pl in per_layer.values())
+    total_super = sum(pl["super_count"] for pl in per_layer.values())
+    total_m = sum(pl["out_features"] for pl in per_layer.values())
+    avg_entropy = sum(pl["normalized_usage_entropy"] for pl in per_layer.values()) / max(len(per_layer), 1)
+    avg_gini = sum(pl["gini"] for pl in per_layer.values()) / max(len(per_layer), 1)
+
+    emit_result({
+        "activation_used": args.activation,
+        "act_threshold": args.act_threshold,
+        "mlp_layers_found": len(per_layer),
+        "layer_order": layer_order,
+        "input_tokens": tokens,
+        "layers": per_layer,
+        "summary": {
+            "total_hidden_neurons": total_m,
+            "total_dead_neurons": total_dead,
+            "dead_pct_global": round(total_dead / max(total_m, 1) * 100, 2),
+            "total_superneurons": total_super,
+            "super_pct_global": round(total_super / max(total_m, 1) * 100, 2),
+            "avg_normalized_usage_entropy": round(avg_entropy, 4),
+            "avg_gini": round(avg_gini, 4),
+        },
+        "agent_hint":
+            "Per-column usage of every MLP 'memory neuron' (W_up output channel). "
+            "dead_count = columns that never fire (wasted capacity -- candidates for removal "
+            "or reassignment to another layer). "
+            "super_count = columns that fire for ~every token (candidates for shared-prefix "
+            "caching across layers -- they are generic, not layer-specific). "
+            "gini in [0,1]: 0 = every neuron carries equal load, 1 = all load on one neuron. "
+            "usage entropy: 1.0 = flat usage, <0.5 = sharply peaked. "
+            "top_neurons list the most output-relevant columns by E[h_j] * ||W_down[:, j]||. "
+            "Use 'mlp-usage-plot' for an HTML heatmap across all layers."
+    })
+
+
+def _mlp_usage_color(val, vmin, vmax):
+    """Map val in [vmin, vmax] to an RGB string. Dark-blue low -> red high."""
+    if vmax <= vmin:
+        v = 0.0
+    else:
+        v = max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
+    if v < 0.33:
+        t = v / 0.33
+        r, g, b = int(10 + t * 10), int(30 + t * 200), 255
+    elif v < 0.66:
+        t = (v - 0.33) / 0.33
+        r, g, b = int(20 + t * 235), 230, int(255 - t * 255)
+    else:
+        t = (v - 0.66) / 0.34
+        r, g, b = 255, int(230 - t * 200), 0
+    return f"rgb({r},{g},{b})"
+
+
+def _generate_mlp_usage_html(layer_stats_list, metric, sort_by, max_cols_shown,
+                             model_info, activation_name):
+    """
+    layer_stats_list: list of (layer_name, dict) where dict has keys
+        'activation_fraction', 'post_mean', 'contribution' (1-D tensors)
+        and summary scalars '_dead_count', '_super_count', '_gini',
+        '_normalized_entropy', '_w_down_used'.
+    metric: 'fraction' | 'magnitude' | 'contribution'
+    sort_by: 'index' (preserve order) | 'metric' (sort each row descending)
+    """
+    metric_key = {
+        "fraction": "activation_fraction",
+        "magnitude": "post_mean",
+        "contribution": "contribution",
+    }[metric]
+    metric_label = {
+        "fraction": "Activation fraction (|h| > threshold)",
+        "magnitude": "Mean |post-activation|",
+        "contribution": "E[|h_j|] * ||W_down[:, j]||",
+    }[metric]
+
+    # Use abs for magnitude so negative post_mean doesn't break coloring.
+    def prepped(arr):
+        return arr.abs() if metric == "magnitude" else arr
+
+    global_max = 0.0
+    for _, stats in layer_stats_list:
+        arr = prepped(stats[metric_key])
+        if arr.numel() > 0:
+            global_max = max(global_max, float(arr.max().item()))
+    if global_max <= 0:
+        global_max = 1.0
+
+    def esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    rows = []
+    for layer_name, stats in layer_stats_list:
+        arr = prepped(stats[metric_key])
+        m = arr.shape[0]
+
+        if sort_by == "metric":
+            display, _ = torch.sort(arr, descending=True)
+        else:
+            display = arr
+
+        if m > max_cols_shown:
+            step = max(1, m // max_cols_shown)
+            display = display[::step]
+        shown_m = display.shape[0]
+
+        cells = []
+        for j in range(shown_m):
+            v = float(display[j].item())
+            color = _mlp_usage_color(v, 0.0, global_max)
+            cells.append(
+                f"<span class='cell' style='background:{color}' "
+                f"title='col {j}: {v:.4f}'></span>"
+            )
+
+        dead = stats.get("_dead_count", 0)
+        super_ = stats.get("_super_count", 0)
+        gini = stats.get("_gini", 0.0)
+        entropy = stats.get("_normalized_entropy", 0.0)
+        w_down_note = "(w_down weighted)" if stats.get("_w_down_used") else "(post-act only)"
+
+        rows.append(
+            f"<div class='layer'>"
+            f"<div class='layer-head'>"
+            f"<span class='layer-name'>{esc(layer_name)}</span>"
+            f"<span class='layer-meta'>m={m} &middot; dead={dead} &middot; super={super_} "
+            f"&middot; gini={gini:.3f} &middot; entropy={entropy:.3f} &middot; {w_down_note}</span>"
+            f"</div>"
+            f"<div class='strip'>{''.join(cells)}</div>"
+            f"</div>"
+        )
+
+    legend_steps = 24
+    legend = "".join(
+        f"<span class='legend-cell' style='background:{_mlp_usage_color(i/(legend_steps-1), 0, 1)}'></span>"
+        for i in range(legend_steps)
+    )
+
+    sort_note = f"sorted by {metric}" if sort_by == "metric" else "original column order"
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MLP Usage Heatmap</title>
+<style>
+  body {{ font-family: monospace; margin: 20px; background: #1a1a2e; color: #e0e0e0; }}
+  h2 {{ color: #00d2ff; margin-bottom: 4px; }}
+  .subtitle {{ color: #a0a0b0; margin-bottom: 16px; font-size: 12px; }}
+  .layer {{ margin-bottom: 14px; }}
+  .layer-head {{ display: flex; justify-content: space-between; margin-bottom: 3px; font-size: 11px; }}
+  .layer-name {{ color: #00d2ff; font-weight: bold; }}
+  .layer-meta {{ color: #a0a0b0; }}
+  .strip {{ display: flex; flex-wrap: nowrap; overflow-x: auto; border: 1px solid #2a2a4a; background: #0a0a1a; padding: 0; }}
+  .cell {{ display: inline-block; width: 2px; height: 22px; flex: 0 0 2px; }}
+  .legend-row {{ display: flex; align-items: center; margin-top: 20px; font-size: 11px; }}
+  .legend-cell {{ width: 16px; height: 14px; display: inline-block; }}
+  .legend-label {{ margin: 0 8px; color: #a0a0b0; }}
+  .info-block {{ padding: 10px; background: #16213e; border-radius: 6px; margin-bottom: 14px; font-size: 12px; }}
+  .info-block b {{ color: #00d2ff; }}
+</style>
+</head>
+<body>
+<h2>MLP Memory Usage Heatmap</h2>
+<div class="subtitle">
+  metric: <b>{metric_label}</b> &middot; activation: <b>{esc(activation_name)}</b> &middot; {sort_note} &middot; {esc(model_info)}
+</div>
+<div class="info-block">
+  Each row is one MLP layer. Each cell is one column of the up-projection's hidden
+  dim -- one 'memory neuron'. Colour encodes how used it is:
+  <b>dark blue</b> = dead / unused, <b>cyan</b> = moderate, <b>yellow/red</b> = heavily used / superneuron.
+  Hover any cell to see its column index and raw value.
+</div>
+<div>
+{''.join(rows)}
+</div>
+<div class="legend-row">
+  <span class="legend-label">0</span>{legend}<span class="legend-label">{global_max:.4f}</span>
+</div>
+</body>
+</html>"""
+
+
+def cmd_mlp_usage_plot(args):
+    model, input_tensor, tokens, is_causal = _load_model_for_analysis(args)
+
+    mlp_modules = _find_mlp_up_modules(
+        model,
+        expansion_threshold=args.expansion_threshold,
+        name_pattern=args.mlp_pattern,
+    )
+    if not mlp_modules:
+        emit_error(
+            "NoMLPsFound",
+            "Could not find any MLP up-projection modules.",
+            "Pass --mlp-pattern '<regex>' to specify which modules to analyze, "
+            "or lower --expansion-threshold."
+        )
+
+    captured = {}
+
+    def make_hook(name):
+        def hook(module, inp, output):
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+            if isinstance(output, torch.Tensor):
+                captured[name] = output.detach().cpu().float()
+        return hook
+
+    handles = []
+    for name, module, _, _ in mlp_modules:
+        handles.append(module.register_forward_hook(make_hook(name)))
+
+    with torch.no_grad():
+        _run_forward_safe(model, input_tensor)
+
+    for h in handles:
+        h.remove()
+
+    if not captured:
+        emit_error("NoMLPCaptured", "No MLP outputs captured during forward pass.",
+                   "The forward pass may have failed. Try 'run-forward' to debug.")
+
+    layer_stats_list = []
+    per_layer_summary = {}
+    for name, module, in_f, out_f in mlp_modules:
+        if name not in captured:
+            continue
+        pre_act = captured[name]
+
+        w_down_info = _find_matching_w_down(model, name, out_f) if args.use_w_down else None
+        w_down_col_norms = None
+        if w_down_info is not None:
+            _, _, w_down_tensor = w_down_info
+            w_down_col_norms = w_down_tensor.detach().cpu().float().norm(dim=0)
+
+        stats = _mlp_column_stats(
+            pre_act,
+            w_down_col_norms,
+            args.activation,
+            args.act_threshold,
+        )
+
+        layer_stats_list.append((name, {
+            "activation_fraction": stats["activation_fraction"],
+            "post_mean": stats["post_mean"],
+            "contribution": stats["contribution"],
+            "_dead_count": stats["dead_count"],
+            "_super_count": stats["super_count"],
+            "_gini": stats["gini"],
+            "_normalized_entropy": stats["normalized_usage_entropy"],
+            "_w_down_used": stats["w_down_used"],
+        }))
+
+        per_layer_summary[name] = {
+            "m": stats["m"],
+            "dead_count": stats["dead_count"],
+            "super_count": stats["super_count"],
+            "gini": stats["gini"],
+            "normalized_usage_entropy": stats["normalized_usage_entropy"],
+            "w_down_used": stats["w_down_used"],
+            "top_neurons": stats["top_neurons"][:5],
+        }
+
+    if not layer_stats_list:
+        emit_error("NoMLPStats", "Detected MLPs but all forward captures were empty.",
+                   "Verify the MLP modules actually run during forward(). Try 'run-forward'.")
+
+    model_info = f"{type(model).__name__}  |  input {list(input_tensor.shape)}"
+    html = _generate_mlp_usage_html(
+        layer_stats_list,
+        metric=args.metric,
+        sort_by=args.sort_by,
+        max_cols_shown=args.max_cols,
+        model_info=model_info,
+        activation_name=args.activation,
+    )
+
+    out_dir = os.path.dirname(os.path.abspath(args.weights))
+    out_name = f"mlp_usage_{args.metric}_{args.sort_by}.html"
+    out_path = os.path.join(out_dir, out_name)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    emit_result({
+        "html_file": os.path.abspath(out_path),
+        "mlp_layers_plotted": len(layer_stats_list),
+        "metric": args.metric,
+        "sort_by": args.sort_by,
+        "activation": args.activation,
+        "per_layer_summary": per_layer_summary,
+        "agent_hint":
+            f"HTML heatmap saved to '{os.path.abspath(out_path)}'. "
+            f"Tell the user to open it in a browser. One row per MLP layer, "
+            f"one cell per memory neuron. Dark blue = dead; red = heavily used. "
+            f"Re-run with --metric fraction|magnitude|contribution and "
+            f"--sort-by index|metric to see different views."
+    })
+
+
 # --- COMPOSABLE PRIMITIVES ---
 
 def cmd_slice(args):
@@ -1804,6 +2405,214 @@ def cmd_block_profile(args):
                       "Compare scalars across blocks to find which blocks the model trusts most. "
                       "Use 'scalars' for deeper analysis of gate/scale parameters. "
                       "Use 'residual-contrib' to see what each block ACTUALLY contributes during a forward pass."
+    })
+
+
+def cmd_bank_profile(args):
+    """Per-slice analysis of a 3-D weight bank [N, *, *].
+
+    For each slice i, reports: stats, effective rank, 99%-energy rank.
+    Also computes the full NxN pairwise cosine similarity matrix and
+    flags any pairs that are suspiciously similar (potential redundancy).
+    """
+    sd = load_weights(args.weights)
+    tensor = get_layer(sd, args.layer).float()
+
+    if tensor.dim() < 2:
+        emit_error("DimensionMismatch",
+                   f"bank-profile needs a tensor with >= 2 dims, got shape {list(tensor.shape)}.",
+                   "Use 'tree' to verify the layer name and its shape.")
+
+    # Treat dim-0 as the 'bank' dimension regardless of rank
+    N = tensor.shape[0]
+    flat = tensor.view(N, -1)   # [N, prod(rest)]
+    slice_dim = flat.shape[1]
+
+    threshold = getattr(args, 'cosine_threshold', 0.5)
+
+    # ── Per-slice stats + rank ──────────────────────────────────────────
+    slices = []
+    for i in range(N):
+        s_flat = flat[i]      # always 1-D, for stats
+        # For SVD use the original un-flattened slice reshaped to 2D
+        slice_orig = tensor[i]   # shape = tensor.shape[1:]
+        if slice_orig.dim() == 1:
+            mat = slice_orig.unsqueeze(0)   # [1, d]
+        elif slice_orig.dim() == 2:
+            mat = slice_orig                # [a, b]
+        else:
+            mat = slice_orig.view(slice_orig.shape[0], -1)  # [a, b*c*...]
+
+        sv = torch.linalg.svdvals(mat)
+        energy = (sv ** 2).cumsum(0) / ((sv ** 2).sum() + 1e-12)
+        rank99 = int((energy < 0.99).sum().item()) + 1
+        eff_rank = float((sv.sum() / (sv.max() + 1e-12)).item())
+        max_rank = min(mat.shape[0], mat.shape[1])
+
+        slices.append({
+            "index": i,
+            "mean": round(s_flat.mean().item(), 6),
+            "std": round(s_flat.std().item(), 6),
+            "l2_norm": round(s_flat.norm().item(), 4),
+            "effective_rank": round(eff_rank, 1),
+            "rank_99pct_energy": rank99,
+            "max_rank": max_rank,
+        })
+
+    # ── Pairwise cosine similarity ──────────────────────────────────────
+    norms = flat.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    normed = flat / norms
+    cos_matrix = (normed @ normed.T)
+
+    # Find suspicious pairs (above threshold, off-diagonal)
+    redundant_pairs = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            c = cos_matrix[i, j].item()
+            if abs(c) > threshold:
+                redundant_pairs.append({
+                    "slice_i": i, "slice_j": j,
+                    "cosine": round(c, 4),
+                    "verdict": "near-duplicate" if c > 0.9 else "similar",
+                })
+
+    # Summary stats of off-diagonal cosines
+    idx_upper = torch.triu_indices(N, N, offset=1)
+    offdiag = cos_matrix[idx_upper[0], idx_upper[1]]
+    cos_summary = {
+        "max": round(offdiag.abs().max().item(), 4),
+        "mean": round(offdiag.mean().item(), 4),
+        "std": round(offdiag.std().item(), 4),
+    }
+
+    # L2 norm trend (weakest slices = candidates for pruning)
+    norms_list = [round(s["l2_norm"], 4) for s in slices]
+    weakest = sorted(range(N), key=lambda i: norms_list[i])[:3]
+
+    verdict = "all_unique"
+    if redundant_pairs:
+        verdict = "has_redundancy"
+    elif cos_summary["max"] < 0.1:
+        verdict = "highly_diverse"
+
+    emit_result({
+        "layer": args.layer,
+        "bank_size": N,
+        "slice_shape": list(tensor.shape[1:]),
+        "verdict": verdict,
+        "slices": slices,
+        "cosine_summary": cos_summary,
+        "redundant_pairs": redundant_pairs,
+        "weakest_slices_by_norm": weakest,
+        "agent_hint": (
+            "verdict='has_redundancy' means some bank slots are near-duplicates and could be merged. "
+            "verdict='highly_diverse' means all slots are well-differentiated — the bank is earning its parameters. "
+            "weakest_slices_by_norm are candidates for pruning if the model can absorb the loss. "
+            "Use 'effective_rank' per slice to see if individual matrices are low-rank."
+        ),
+    })
+
+
+def cmd_gate_audit(args):
+    """Scan all learnable parameters for near-zero gate/scale patterns.
+
+    Finds every tensor that looks like a gate, scale, temperature, or mix
+    weight, reports its current magnitude relative to 'expected active' range,
+    and flags those that the model has learned to nearly silence.
+    """
+    sd = load_weights(args.weights)
+    zero_thresh = getattr(args, 'zero_threshold', 0.05)
+    low_thresh  = getattr(args, 'low_threshold',  0.1)
+
+    # Keywords that suggest a parameter is a learned gate / scale
+    _GATE_KEYWORDS = ("scale", "gate", "mix", "weight", "alpha", "beta",
+                      "gain", "temperature", "temp", "bias", "factor", "ratio")
+
+    findings = []
+    total_gated_params = 0
+
+    for name, tensor in sd.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        t = tensor.float()
+
+        # Heuristic: likely a gate/scale if:
+        #   (a) numel <= 1024 AND name contains a gate keyword, OR
+        #   (b) numel == 1 (always a scalar control), OR
+        #   (c) shape is 1-D and numel <= 512
+        name_lower = name.lower()
+        is_gate_name = any(kw in name_lower for kw in _GATE_KEYWORDS)
+        is_small = t.numel() <= 512
+        is_scalar = t.numel() == 1
+
+        if not (is_scalar or (is_gate_name and is_small)):
+            continue
+
+        vals = t.flatten().tolist()
+        abs_mean = abs(sum(vals) / len(vals))
+        abs_max  = max(abs(v) for v in vals)
+        near_zero_count = sum(1 for v in vals if abs(v) < zero_thresh)
+        near_zero_pct = near_zero_count / len(vals) * 100
+
+        # Determine status
+        if abs_mean < zero_thresh:
+            status = "DEAD"
+            priority = "HIGH"
+        elif abs_mean < low_thresh:
+            status = "WEAK"
+            priority = "MED"
+        elif all(abs(v - 1.0) < 0.1 for v in vals):
+            status = "IDENTITY"
+            priority = "LOW"
+        else:
+            status = "ACTIVE"
+            priority = None
+
+        entry = {
+            "name": name,
+            "shape": list(t.shape),
+            "numel": t.numel(),
+            "abs_mean": round(abs_mean, 6),
+            "abs_max": round(abs_max, 6),
+            "near_zero_pct": round(near_zero_pct, 1),
+            "status": status,
+            "values_preview": [round(v, 5) for v in vals[:8]],
+        }
+        if priority:
+            entry["priority"] = priority
+        findings.append(entry)
+        total_gated_params += t.numel()
+
+    # Sort: DEAD first, then WEAK, then IDENTITY, then ACTIVE
+    _order = {"DEAD": 0, "WEAK": 1, "IDENTITY": 2, "ACTIVE": 3}
+    findings.sort(key=lambda x: (_order.get(x["status"], 9), -x["abs_mean"]))
+
+    dead    = [f for f in findings if f["status"] == "DEAD"]
+    weak    = [f for f in findings if f["status"] == "WEAK"]
+    identity = [f for f in findings if f["status"] == "IDENTITY"]
+    active  = [f for f in findings if f["status"] == "ACTIVE"]
+
+    # Estimate params that could be removed (DEAD gates own their downstream params)
+    removable_params = sum(f["numel"] for f in dead)
+
+    emit_result({
+        "total_gate_params_scanned": total_gated_params,
+        "summary": {
+            "DEAD":     len(dead),
+            "WEAK":     len(weak),
+            "IDENTITY": len(identity),
+            "ACTIVE":   len(active),
+        },
+        "removable_gate_params": removable_params,
+        "findings": findings,
+        "agent_hint": (
+            "DEAD gates (abs_mean < 0.05) are the clearest parameter golf targets: "
+            "the model has learned to silence them. Removing the gate AND its associated "
+            "module (embedding, projection, etc.) saves the full downstream parameter count. "
+            "WEAK gates contribute little but are not zero — profile loss before removing. "
+            "IDENTITY gates (near 1.0) are pass-throughs and may be architectural remnants. "
+            "Use 'scalars' for a richer group-level view of scalar parameters."
+        ),
     })
 
 
@@ -2247,6 +3056,91 @@ def main():
     p.add_argument("--head-idx", type=int, default=0,
                    help="0-based index of the attention head to plot (default: 0).")
 
+    p = _make_sub(subparsers, "mlp-usage",
+                  "Per-column usage statistics for every MLP 'memory neuron'.",
+                  "Runs a forward pass, hooks each up-projection (W_up, fc1, c_fc, ...),\n"
+                  "applies an activation function, and reports per-column usage metrics:\n"
+                  "  - activation_fraction: P(|h_j| > threshold)\n"
+                  "  - post_mean: E[h_j] after the activation\n"
+                  "  - contribution: E[|h_j|] * ||W_down[:, j]||  (actual impact on output)\n"
+                  "  - dead_count / super_count / gini / usage entropy\n"
+                  "  - top & bottom neurons by contribution\n\n"
+                  "Interprets MLPs as key-value memories (Geva 2020): each column of\n"
+                  "W_up is a 'key', the matching W_down column is its 'value'. Dead\n"
+                  "columns = wasted capacity. Superneurons (fire ~always) = candidates\n"
+                  "for a shared prefix cache across layers. Top contribution neurons =\n"
+                  "the cells that actually move the residual stream.\n\n"
+                  "Auto-detects up-projections by: (a) name keywords (fc1, c_fc, w_up,\n"
+                  "up_proj, ...) AND/OR (b) expansion shape (out >= in * threshold).\n"
+                  "Pass --mlp-pattern '<regex>' to override and pick modules explicitly.\n\n"
+                  "If your MLP uses a fused block (module whose forward applies W_up,\n"
+                  "activation, W_down in one go), hook the internal up-projection with\n"
+                  "--mlp-pattern and use --activation identity to skip re-activating.\n\n"
+                  "Examples:\n"
+                  "  python iride.py mlp-usage \\\n"
+                  "    --script model.py --model-class GPT \\\n"
+                  "    --weights gpt.pt --tokenizer gpt2 --text \"Hello world\"\n\n"
+                  "  python iride.py mlp-usage \\\n"
+                  "    --script model.py --model-class GPT \\\n"
+                  "    --weights gpt.pt --input-shape 4,512 \\\n"
+                  "    --activation relu2 --mlp-pattern 'blocks\\.\\d+\\.mlp\\.up'")
+    _add_analysis_args(p)
+    p.add_argument("--activation", choices=list(_MLP_ACTIVATIONS.keys()), default="relu2",
+                   help="Activation to apply after the up-projection (default: relu2).")
+    p.add_argument("--act-threshold", type=float, default=1e-6, dest="act_threshold",
+                   help="Post-activation |value| above which a neuron counts as 'firing' (default: 1e-6).")
+    p.add_argument("--expansion-threshold", type=float, default=1.5, dest="expansion_threshold",
+                   help="Min out/in ratio for auto-detecting an MLP up-projection (default: 1.5).")
+    p.add_argument("--mlp-pattern", default=None, dest="mlp_pattern",
+                   help="Optional regex matched against module names to select MLPs (overrides auto-detect).")
+    p.add_argument("--use-w-down", action="store_true", default=True, dest="use_w_down",
+                   help="Weight contribution by ||W_down[:, j]|| (default: on).")
+    p.add_argument("--no-w-down", action="store_false", dest="use_w_down",
+                   help="Disable W_down weighting (report raw post-activation magnitudes).")
+
+    p = _make_sub(subparsers, "mlp-usage-plot",
+                  "HTML heatmap of MLP column usage across all layers.",
+                  "Same analysis as 'mlp-usage' but renders a self-contained HTML file\n"
+                  "(dark theme, colour-coded strips, one row per MLP layer). Each cell\n"
+                  "is one memory neuron; colour encodes how used it is. Mirrors the\n"
+                  "style of 'attention-plot' but for MLPs.\n\n"
+                  "Columns shown in original order (--sort-by index) reveal any spatial\n"
+                  "structure -- e.g. shared-prefix clustering near column 0, dead tails,\n"
+                  "periodic patterns. Sorted by usage (--sort-by metric) reveals the\n"
+                  "head/tail distribution cleanly.\n\n"
+                  "--metric fraction    = P(neuron fires | any token)\n"
+                  "--metric magnitude   = E[|h_j|] post-activation\n"
+                  "--metric contribution= E[|h_j|] * ||W_down[:, j]||  (default, most honest)\n\n"
+                  "Output file is written next to the weights as\n"
+                  "  mlp_usage_<metric>_<sort-by>.html\n\n"
+                  "Examples:\n"
+                  "  python iride.py mlp-usage-plot \\\n"
+                  "    --script model.py --model-class GPT \\\n"
+                  "    --weights gpt.pt --text \"The cat sat on\" --tokenizer gpt2\n\n"
+                  "  python iride.py mlp-usage-plot \\\n"
+                  "    --script model.py --model-class GPT \\\n"
+                  "    --weights gpt.pt --input-shape 4,512 \\\n"
+                  "    --metric fraction --sort-by metric --max-cols 2048")
+    _add_analysis_args(p)
+    p.add_argument("--activation", choices=list(_MLP_ACTIVATIONS.keys()), default="relu2",
+                   help="Activation to apply after W_up (default: relu2).")
+    p.add_argument("--act-threshold", type=float, default=1e-6, dest="act_threshold",
+                   help="Post-activation firing threshold (default: 1e-6).")
+    p.add_argument("--expansion-threshold", type=float, default=1.5, dest="expansion_threshold",
+                   help="Min out/in expansion for auto-detect (default: 1.5).")
+    p.add_argument("--mlp-pattern", default=None, dest="mlp_pattern",
+                   help="Optional regex for module-name-based MLP selection.")
+    p.add_argument("--metric", choices=["fraction", "magnitude", "contribution"], default="contribution",
+                   help="Per-column metric to colour (default: contribution).")
+    p.add_argument("--sort-by", choices=["index", "metric"], default="index", dest="sort_by",
+                   help="Column ordering within each row (default: index).")
+    p.add_argument("--max-cols", type=int, default=1024, dest="max_cols",
+                   help="Max cells rendered per row; larger rows are stride-sampled (default: 1024).")
+    p.add_argument("--use-w-down", action="store_true", default=True, dest="use_w_down",
+                   help="Weight by ||W_down[:, j]|| (default: on).")
+    p.add_argument("--no-w-down", action="store_false", dest="use_w_down",
+                   help="Disable W_down weighting.")
+
     p = _make_sub(subparsers, "run-forward",
                   "Run a forward pass and capture activation stats per layer.",
                   "Hooks every submodule and records output shape, mean, std, min,\n"
@@ -2336,6 +3230,39 @@ def main():
 
     # ── Interpretive Analysis ────────────────────────────────────────
 
+    p = _make_sub(subparsers, "bank-profile",
+                  "Per-slice analysis of a 3-D weight bank [N, *, *].",
+                  "Iterates over the N slices of a weight bank, reports per-slice stats\n"
+                  "and rank, then computes the full pairwise cosine similarity matrix\n"
+                  "to detect redundant or near-duplicate bank slots.\n\n"
+                  "Useful for shared weight banks (qo_bank, kv_bank, mlp_up_bank, etc.)\n"
+                  "to see if all N slots are genuinely distinct or some can be merged.\n\n"
+                  "Examples:\n"
+                  "  python iride.py bank-profile model.pt --layer qo_bank\n"
+                  "  python iride.py bank-profile model.pt --layer kv_bank --cosine-threshold 0.3")
+    p.add_argument("weights", help="Path to the .pt file.")
+    p.add_argument("--layer", required=True, help="Name of the bank layer (must be >= 2-D).")
+    p.add_argument("--cosine-threshold", type=float, default=0.5, dest="cosine_threshold",
+                   help="Cosine similarity above which two slices are flagged as similar (default: 0.5).")
+
+    p = _make_sub(subparsers, "gate-audit",
+                  "Scan all gate/scale parameters and flag near-zero ones.",
+                  "Finds every learnable parameter that looks like a gate, scale, temperature,\n"
+                  "or mix weight (small tensor, name contains 'scale'/'gate'/'mix'/etc.),\n"
+                  "measures its current magnitude, and classifies it:\n"
+                  "  DEAD     — abs_mean < 0.05 (model silenced it, safe to remove)\n"
+                  "  WEAK     — abs_mean < 0.10 (contributes little)\n"
+                  "  IDENTITY — near 1.0 (pass-through, possible dead hedge)\n"
+                  "  ACTIVE   — genuinely used\n\n"
+                  "Examples:\n"
+                  "  python iride.py gate-audit model.pt\n"
+                  "  python iride.py gate-audit model.pt --zero-threshold 0.03")
+    p.add_argument("weights", help="Path to the .pt file.")
+    p.add_argument("--zero-threshold", type=float, default=0.05, dest="zero_threshold",
+                   help="Abs mean below which a gate is classified DEAD (default: 0.05).")
+    p.add_argument("--low-threshold", type=float, default=0.10, dest="low_threshold",
+                   help="Abs mean below which a gate is classified WEAK (default: 0.10).")
+
     p = _make_sub(subparsers, "scalars",
                   "Find and interpret all scalar/small learned parameters.",
                   "Discovers gates, scales, temperatures, skip weights, and any other\n"
@@ -2389,6 +3316,8 @@ def main():
         "residual-stream": cmd_residual_stream,
         "attention": cmd_attention,
         "attention-plot": cmd_attention_plot,
+        "mlp-usage": cmd_mlp_usage,
+        "mlp-usage-plot": cmd_mlp_usage_plot,
         "run-forward": cmd_run_forward,
         "slice": cmd_slice,
         "topk": cmd_topk,
@@ -2398,6 +3327,8 @@ def main():
         "scalars": cmd_scalars,
         "block-profile": cmd_block_profile,
         "residual-contrib": cmd_residual_contrib,
+        "bank-profile": cmd_bank_profile,
+        "gate-audit": cmd_gate_audit,
     }
 
     try:
