@@ -33,7 +33,7 @@ One file. No framework. No config.
 ## quick start
 
 ```bash
-python iride.py diagnose model.pt          # full health report
+python iride.py scan model.pt              # bulk anomaly scan
 python iride.py tree model.pt              # show architecture
 python iride.py scalars model.pt           # find gates, scales, skip weights
 python iride.py block-profile model.pt     # per-block depth trends
@@ -52,18 +52,20 @@ python iride.py residual-contrib \         # what each block contributes
 
 ---
 
-## 21 commands, 4 tiers
+## 25 commands, 4 tiers
 
 ```
 WEIGHT INSPECTION                 no forward pass
   tree            layers, shapes, dtypes, param counts
-  diagnose        verdict (HEALTHY/DEGRADED/BROKEN), score, action plan
   scan            bulk anomaly detection, all layers at once
   stats           single layer statistics
   histogram       distribution shape, percentiles, skewness, kurtosis
   sparsity        dead neurons, structured sparsity, weakest indices
   compare-init    drift from kaiming / xavier / lecun initialization
   svd             rank, condition number, singular values
+  stable-rank     per-layer stable rank, effective rank, rank collapse detection
+  qk-spectral     per-head Q@K^T spectral norm, attention divergence risk
+  super-weights   outlier FFN parameters (critical for quantization)
   diff            compare a layer between two checkpoints
 
 TRANSFORMER ANALYSIS              requires forward pass
@@ -71,6 +73,8 @@ TRANSFORMER ANALYSIS              requires forward pass
   attention       per-head entropy, diagonality, verticality, patterns
   attention-plot  html heatmap with optional hf tokenizer labels
   run-forward     per-layer activation stats, nan/inf tracing
+  massive-activations  outlier hidden-state scalars (Sun et al. 2024)
+  dormant-heads   per-head output-norm dormancy (Sanyal et al. 2025)
 
 INTERPRETIVE ANALYSIS             what the model is trying to do
   scalars         find and interpret all gates, scales, skip weights
@@ -93,7 +97,7 @@ success:
 ```json
 {
   "status": "success",
-  "data": { "verdict": "DEGRADED", "health_score": 70, "..." : "..." }
+  "data": { "rank": 512, "condition_number": 42.3, "..." : "..." }
 }
 ```
 

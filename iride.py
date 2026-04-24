@@ -683,137 +683,620 @@ def cmd_compare_init(args):
     })
 
 
-def cmd_diagnose(args):
-    """The master command: runs tree + scan + svd on all weight matrices.
-    Produces a single prioritized report."""
+# --- LLM WEIGHT DIAGNOSTICS ---
+
+def cmd_stable_rank(args):
     sd = load_weights(args.weights)
 
-    # Phase 1: Architecture summary
-    arch = {}
-    total_params = 0
-    for k, v in sd.items():
-        if isinstance(v, torch.Tensor):
-            arch[k] = {"shape": list(v.shape), "numel": v.numel()}
-            total_params += v.numel()
+    layers = {}
+    n_scanned = 0
+    n_skipped_1d = 0
+    n_skipped_nd = 0
+    n_skipped_embed = 0
+    n_skipped_too_small = 0
+    n_error = 0
 
-    # Phase 2: Full scan with anomaly detection
-    layer_reports = {}
-    all_issues = []
+    srank_vals = []
+    erank_vals = []
+    srank_ratios = []
+    erank_ratios = []
+    low_stable_rank_layers = 0
+    low_effective_rank_layers = 0
+    critical_layers = 0
+    worst_layer = None
+    worst_srank_ratio = float("inf")
+
+    def _round_ratio(x):
+        return round(x, 6) if x < 0.01 else round(x, 4)
 
     for name, v in sd.items():
         if not isinstance(v, torch.Tensor):
             continue
-        t = v.float()
-        stats = _compute_layer_stats(t)
-        anomalies = _detect_anomalies(name, t, stats)
 
-        report = {
-            "stats": stats,
-            "anomalies": anomalies,
+        # Skip 1D tensors (biases, norms)
+        if v.dim() == 1:
+            n_skipped_1d += 1
+            continue
+
+        # Handle N-D tensors
+        if v.dim() != 2:
+            if args.flatten:
+                tensor = v.float().view(v.size(0), -1)
+            else:
+                n_skipped_nd += 1
+                continue
+        else:
+            tensor = v.float()
+
+        shape = list(tensor.shape)
+
+        # Skip embeddings when requested
+        if args.skip_embeddings and "embed" in name.lower() and max(shape) > args.embed_threshold:
+            n_skipped_embed += 1
+            continue
+
+        # Skip too-small matrices
+        if min(shape) < args.min_dim:
+            n_skipped_too_small += 1
+            continue
+
+        # NaN/Inf guard
+        if torch.isnan(tensor).any().item() or torch.isinf(tensor).any().item():
+            layers[name] = {
+                "shape": shape,
+                "status": "error",
+                "reason": "nan_or_inf",
+            }
+            n_error += 1
+            continue
+
+        try:
+            sigma = torch.linalg.svdvals(tensor)
+        except Exception as e:
+            layers[name] = {
+                "shape": shape,
+                "status": "error",
+                "reason": f"svd_failed: {str(e)}",
+            }
+            n_error += 1
+            continue
+
+        s_max = sigma[0].item()
+        if s_max <= 0.0 or not math.isfinite(s_max):
+            layers[name] = {
+                "shape": shape,
+                "status": "error",
+                "reason": "degenerate_spectrum",
+            }
+            n_error += 1
+            continue
+
+        sigma_sq = sigma * sigma
+        stable_rank = (sigma_sq.sum() / (sigma[0] * sigma[0])).item()
+
+        sigma_sum = sigma.sum().item()
+        if sigma_sum <= 0.0:
+            layers[name] = {
+                "shape": shape,
+                "status": "error",
+                "reason": "zero_spectrum",
+            }
+            n_error += 1
+            continue
+
+        p = sigma / sigma.sum()
+        entropy = -(p * torch.log(p + 1e-12)).sum().item()
+        effective_rank = math.exp(entropy)
+
+        max_rank = min(shape)
+        srank_ratio = stable_rank / max_rank
+        erank_ratio = effective_rank / max_rank
+
+        # Status determination
+        if stable_rank < 3.0:
+            status = "critical"
+            critical_layers += 1
+        elif srank_ratio < 0.1 or erank_ratio < 0.5:
+            status = "warning"
+        else:
+            status = "ok"
+
+        if srank_ratio < 0.1:
+            low_stable_rank_layers += 1
+        if erank_ratio < 0.5:
+            low_effective_rank_layers += 1
+
+        if srank_ratio < worst_srank_ratio:
+            worst_srank_ratio = srank_ratio
+            worst_layer = name
+
+        layers[name] = {
+            "shape": shape,
+            "stable_rank": round(stable_rank, 4),
+            "effective_rank": round(effective_rank, 4),
+            "max_rank": max_rank,
+            "srank_ratio": _round_ratio(srank_ratio),
+            "erank_ratio": _round_ratio(erank_ratio),
+            "status": status,
         }
 
-        # Phase 3: Auto-SVD on 2D weight matrices
-        if t.dim() == 2 and "weight" in name:
-            try:
-                U, S, Vh = torch.linalg.svd(t, full_matrices=False)
-                s_min = S[-1].item()
-                s_max = S[0].item()
-                cond = (s_max / s_min) if s_min > 1e-7 else float('inf')
-                rank = torch.linalg.matrix_rank(t).item()
-                max_rank = min(t.shape)
+        n_scanned += 1
+        srank_vals.append(stable_rank)
+        erank_vals.append(effective_rank)
+        srank_ratios.append(srank_ratio)
+        erank_ratios.append(erank_ratio)
 
-                report["svd"] = {
-                    "rank": rank,
-                    "max_rank": max_rank,
-                    "is_rank_deficient": rank < max_rank,
-                    "condition_number": cond if cond != float('inf') else "Infinity",
-                    "top_3_singular": S[:3].tolist(),
-                    "bottom_3_singular": S[-3:].tolist(),
-                }
+    def _mean(xs):
+        return round(sum(xs) / len(xs), 4) if xs else 0.0
 
-                if rank < max_rank:
-                    anomalies.append({
-                        "severity": "warning",
-                        "message": f"{name} is rank-deficient ({rank}/{max_rank}). Dimensional collapse detected.",
-                        "suggested_fix": "This layer has redundant dimensions. May indicate undertrained or collapsed representations."
-                    })
-                if isinstance(cond, float) and cond > 1e4:
-                    sev = "critical" if cond > 1e6 else "warning"
-                    anomalies.append({
-                        "severity": sev,
-                        "message": f"{name} has condition number {cond:.0f}. Numerically unstable.",
-                        "suggested_fix": "High condition number means tiny input changes cause huge output swings. Check for degenerate training."
-                    })
-            except Exception:
-                report["svd"] = {"error": "SVD computation failed — tensor may be degenerate."}
-
-        # Phase 4: Init comparison for weight matrices
-        if t.dim() >= 2 and "weight" in name and "bias" not in name:
-            fan_in = t.shape[1]
-            for d in t.shape[2:]:
-                fan_in *= d
-            kaiming_std = math.sqrt(2.0 / fan_in)
-            actual_std = stats["std"]
-            drift = actual_std / kaiming_std if kaiming_std > 1e-9 else float('inf')
-            report["init_drift"] = {
-                "actual_std": round(actual_std, 6),
-                "kaiming_expected_std": round(kaiming_std, 6),
-                "drift_ratio": round(drift, 4),
-            }
-
-        # Assign overall severity
-        if any(a["severity"] == "critical" for a in anomalies):
-            report["severity"] = "critical"
-        elif any(a["severity"] == "warning" for a in anomalies):
-            report["severity"] = "warning"
-        else:
-            report["severity"] = "ok"
-
-        layer_reports[name] = report
-        all_issues.extend([(name, a) for a in anomalies])
-
-    # Build prioritized action plan
-    critical_actions = []
-    warning_actions = []
-
-    for name, issue in all_issues:
-        entry = {"layer": name, "issue": issue["message"], "fix": issue["suggested_fix"]}
-        if issue["severity"] == "critical":
-            critical_actions.append(entry)
-        elif issue["severity"] == "warning":
-            warning_actions.append(entry)
-
-    # Overall health score: 0 (broken) to 100 (perfect)
-    n_layers = len(layer_reports)
-    critical_count = sum(1 for _, r in layer_reports.items() if r["severity"] == "critical")
-    warning_count = sum(1 for _, r in layer_reports.items() if r["severity"] == "warning")
-    health_score = max(0, 100 - (critical_count * 30) - (warning_count * 10))
-
-    if health_score >= 80:
-        verdict = "HEALTHY"
-    elif health_score >= 50:
-        verdict = "DEGRADED"
-    else:
-        verdict = "BROKEN"
+    summary = {
+        "n_layers_scanned": n_scanned,
+        "n_skipped_1d": n_skipped_1d,
+        "n_skipped_nd": n_skipped_nd,
+        "n_skipped_embed": n_skipped_embed,
+        "n_skipped_too_small": n_skipped_too_small,
+        "n_error": n_error,
+        "mean_stable_rank": _mean(srank_vals),
+        "mean_effective_rank": _mean(erank_vals),
+        "mean_srank_ratio": _mean(srank_ratios),
+        "mean_erank_ratio": _mean(erank_ratios),
+        "low_stable_rank_layers": low_stable_rank_layers,
+        "low_effective_rank_layers": low_effective_rank_layers,
+        "critical_layers": critical_layers,
+        "worst_layer": worst_layer,
+        "worst_srank_ratio": _round_ratio(worst_srank_ratio) if worst_layer is not None else None,
+    }
 
     emit_result({
-        "verdict": verdict,
-        "health_score": health_score,
-        "total_parameters": total_params,
-        "total_layers": n_layers,
-        "critical_layers": critical_count,
-        "warning_layers": warning_count,
-        "healthy_layers": n_layers - critical_count - warning_count,
-        "layer_reports": layer_reports,
-        "action_plan": {
-            "critical": critical_actions,
-            "warnings": warning_actions,
-        },
-        "agent_hint": f"Verdict: {verdict} (score {health_score}/100). "
-                      f"{'Address critical issues first — they indicate non-functional layers.' if critical_count > 0 else ''} "
-                      f"{'Warnings suggest suboptimal training — investigate but not blocking.' if warning_count > 0 else ''} "
-                      f"Use 'histogram --layer <name>' for deeper distribution analysis on flagged layers. "
-                      f"Use 'run-forward' if weights look fine but inference still fails."
+        "weights": args.weights,
+        "layers": layers,
+        "summary": summary,
+        "agent_hint": "stable_rank is the effective number of 'loud' singular directions (||W||_F^2 / sigma_max^2); effective_rank = exp(spectral entropy). Ratios much less than 1 mean rank collapse: srank_ratio < 0.1 or absolute stable_rank < 3 signals gradient pathology or dead subspace - inspect worst_layer first."
+    })
+
+
+def _infer_num_heads(d_model, preferred_d_heads=(64, 96, 128, 80, 256)):
+    """Infer num_heads from d_model by matching a preferred d_head size.
+
+    Returns the first num_heads whose corresponding d_head appears in
+    preferred_d_heads (in the order given). If multiple divisors match or
+    none do, returns None.
+    """
+    matches = []
+    for d_head in preferred_d_heads:
+        if d_head <= 0:
+            continue
+        if d_model % d_head == 0:
+            matches.append((d_head, d_model // d_head))
+    if not matches:
+        return None
+    # Prefer first match in preferred order
+    return matches[0][1]
+
+
+# Suffix patterns for Q/K projection weight naming conventions
+_Q_SUFFIXES = (
+    ".q_proj.weight",
+    ".wq.weight",
+    ".q.weight",
+    ".query.weight",
+)
+_K_SUFFIXES = (
+    ".k_proj.weight",
+    ".wk.weight",
+    ".k.weight",
+    ".key.weight",
+)
+_FUSED_SUFFIXES = (
+    ".c_attn.weight",
+    ".qkv_proj.weight",
+    ".Wqkv.weight",
+)
+
+
+def cmd_qk_spectral(args):
+    sd = load_weights(args.weights)
+
+    # Group Q/K matrices by parent attention layer.
+    # Each entry: {"Q": tensor, "K": tensor, "fused": bool, "source": str}
+    layer_groups = {}
+    unresolved = []
+
+    for name, v in sd.items():
+        if not isinstance(v, torch.Tensor):
+            continue
+        if v.dim() < 2:
+            continue
+
+        matched = False
+
+        # Fused QKV (GPT-2 c_attn, Qwen qkv_proj, BLOOM Wqkv)
+        for suf in _FUSED_SUFFIXES:
+            if name.endswith(suf):
+                parent = name[:-len(suf)]
+                t = v.float()
+                if t.dim() != 2 or t.shape[0] % 3 != 0:
+                    unresolved.append({"layer": parent, "reason": f"fused_bad_shape: {list(t.shape)}"})
+                    matched = True
+                    break
+                chunk = t.shape[0] // 3
+                Q = t[0:chunk]
+                K = t[chunk:2 * chunk]
+                entry = layer_groups.setdefault(parent, {"Q": None, "K": None, "fused": True, "source": name})
+                entry["Q"] = Q
+                entry["K"] = K
+                entry["fused"] = True
+                entry["source"] = name
+                matched = True
+                break
+        if matched:
+            continue
+
+        # Separate Q
+        for suf in _Q_SUFFIXES:
+            if name.endswith(suf):
+                parent = name[:-len(suf)]
+                entry = layer_groups.setdefault(parent, {"Q": None, "K": None, "fused": False, "source": parent})
+                entry["Q"] = v.float()
+                entry["fused"] = entry.get("fused", False)
+                matched = True
+                break
+        if matched:
+            continue
+
+        # Separate K
+        for suf in _K_SUFFIXES:
+            if name.endswith(suf):
+                parent = name[:-len(suf)]
+                entry = layer_groups.setdefault(parent, {"Q": None, "K": None, "fused": False, "source": parent})
+                entry["K"] = v.float()
+                entry["fused"] = entry.get("fused", False)
+                matched = True
+                break
+
+    if not layer_groups:
+        emit_error(
+            "NoAttentionWeightsFound",
+            "No attention Q/K weight matrices were detected in the state_dict.",
+            "Expected state_dict keys matching *.q_proj.weight / *.k_proj.weight or *.c_attn.weight. Use 'tree' to list layers.",
+        )
+
+    flag_threshold = float(args.flag_threshold)
+    warn_threshold = 0.5 * flag_threshold
+
+    layers_out = {}
+    max_sigmas = []
+    flagged_layers = 0
+    global_max_sigma = -1.0
+    global_max_layer = None
+    global_max_head = -1
+
+    for parent, entry in layer_groups.items():
+        Q = entry.get("Q")
+        K = entry.get("K")
+        if Q is None or K is None:
+            missing = "Q" if Q is None else "K"
+            unresolved.append({"layer": parent, "reason": f"missing_{missing}"})
+            continue
+
+        if Q.dim() != 2 or K.dim() != 2:
+            unresolved.append({"layer": parent, "reason": f"non_2d_shape: Q={list(Q.shape)} K={list(K.shape)}"})
+            continue
+
+        d_q = Q.shape[0]
+        d_k = K.shape[0]
+        d_model = Q.shape[1]
+        if K.shape[1] != d_model:
+            unresolved.append({"layer": parent, "reason": f"dim_mismatch: Q={list(Q.shape)} K={list(K.shape)}"})
+            continue
+
+        # Resolve num_heads for this layer
+        if args.num_heads is not None:
+            num_heads_q = int(args.num_heads)
+        else:
+            num_heads_q = _infer_num_heads(d_q)
+            if num_heads_q is None:
+                emit_error(
+                    "UnknownNumHeads",
+                    f"Could not infer num_heads for layer '{parent}' (Q shape {list(Q.shape)}, d_model {d_model}).",
+                    "pass --num-heads",
+                )
+
+        if num_heads_q <= 0 or d_q % num_heads_q != 0:
+            unresolved.append({"layer": parent, "reason": f"num_heads_invalid: d_q={d_q} num_heads={num_heads_q}"})
+            continue
+
+        d_head = d_q // num_heads_q
+        if d_head <= 0 or d_k % d_head != 0:
+            unresolved.append({"layer": parent, "reason": f"d_head_invalid: d_head={d_head} d_k={d_k}"})
+            continue
+
+        num_kv_heads = d_k // d_head
+        scale = 1.0 / math.sqrt(d_head)
+
+        per_head_sigma = []
+        critical_heads = 0
+        warning_heads = 0
+        layer_status = "ok"
+
+        for h in range(num_heads_q):
+            kv_h = h * num_kv_heads // num_heads_q
+            Wq_h = Q[h * d_head:(h + 1) * d_head]
+            Wk_h = K[kv_h * d_head:(kv_h + 1) * d_head]
+            if torch.isnan(Wq_h).any().item() or torch.isinf(Wq_h).any().item() \
+                    or torch.isnan(Wk_h).any().item() or torch.isinf(Wk_h).any().item():
+                per_head_sigma.append(None)
+                continue
+
+            M = Wq_h @ Wk_h.t()
+            try:
+                sv = torch.linalg.svdvals(M)
+            except Exception:
+                per_head_sigma.append(None)
+                continue
+
+            sigma = sv[0].item() * scale
+            if not math.isfinite(sigma):
+                per_head_sigma.append(None)
+                continue
+
+            per_head_sigma.append(round(sigma, 4))
+
+            if sigma > flag_threshold:
+                critical_heads += 1
+                layer_status = "critical"
+            elif sigma > warn_threshold:
+                warning_heads += 1
+                if layer_status != "critical":
+                    layer_status = "warning"
+
+            if sigma > global_max_sigma:
+                global_max_sigma = sigma
+                global_max_layer = parent
+                global_max_head = h
+
+        valid_sigmas = [s for s in per_head_sigma if s is not None]
+        if not valid_sigmas:
+            unresolved.append({"layer": parent, "reason": "all_heads_failed"})
+            continue
+
+        max_sigma = max(valid_sigmas)
+        mean_sigma = sum(valid_sigmas) / len(valid_sigmas)
+
+        layers_out[parent] = {
+            "num_heads": num_heads_q,
+            "num_kv_heads": num_kv_heads,
+            "d_head": d_head,
+            "fused": bool(entry.get("fused", False)),
+            "per_head_sigma": per_head_sigma,
+            "max_sigma": round(max_sigma, 4),
+            "mean_sigma": round(mean_sigma, 4),
+            "critical_heads": critical_heads,
+            "warning_heads": warning_heads,
+            "status": layer_status,
+        }
+
+        max_sigmas.append(max_sigma)
+        if layer_status != "ok":
+            flagged_layers += 1
+
+    if not layers_out:
+        emit_error(
+            "NoAttentionWeightsFound",
+            "Detected Q/K candidates but none resolved into a valid attention layer.",
+            "Expected state_dict keys matching *.q_proj.weight / *.k_proj.weight or *.c_attn.weight. Use 'tree' to list layers.",
+        )
+
+    mean_max = sum(max_sigmas) / len(max_sigmas) if max_sigmas else 0.0
+
+    summary = {
+        "n_layers": len(layers_out),
+        "n_flagged": flagged_layers,
+        "mean_max_sigma": round(mean_max, 4),
+        "global_max_sigma": round(global_max_sigma, 4) if global_max_layer is not None else None,
+        "global_max_layer": global_max_layer,
+        "global_max_head": global_max_head if global_max_layer is not None else None,
+        "unresolved_layers": unresolved,
+    }
+
+    emit_result({
+        "weights": args.weights,
+        "num_heads": int(args.num_heads) if args.num_heads is not None else None,
+        "flag_threshold": flag_threshold,
+        "layers": layers_out,
+        "summary": summary,
+        "agent_hint": "Per-head sigma_max(W_Q W_K^T)/sqrt(d_head) > 100 is a known attention-entropy-collapse precursor (Zhai 2023, Takase 2025). Critical layers warrant QK-RMSNorm, z-loss, or sigmaReparam before resuming training.",
+    })
+
+
+# Suffix patterns for FFN down-projection weight naming conventions
+_DOWN_PROJ_SUFFIXES = (
+    ".mlp.down_proj.weight",
+    ".mlp.c_proj.weight",
+    ".mlp.W_down.weight",
+    ".ffn.down_proj.weight",
+    ".feed_forward.w2.weight",
+)
+
+# Suffix patterns for attention output-projection weight naming conventions
+_O_PROJ_SUFFIXES = (
+    ".self_attn.o_proj.weight",
+    ".attn.c_proj.weight",
+    ".self_attn.Wo.weight",
+    ".attn.out_proj.weight",
+)
+
+# Dtype set for quantized tensors that we cannot meaningfully scan
+_QUANTIZED_DTYPES = {torch.int8, torch.uint8, torch.qint8}
+if hasattr(torch, "int4"):
+    _QUANTIZED_DTYPES.add(torch.int4)
+
+
+def _extract_layer_idx(name):
+    """Extract the first integer layer index from a layer name (e.g. 'model.layers.2.mlp.down_proj.weight' -> 2)."""
+    m = re.search(r"\.(\d+)\.", name)
+    if m is None:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def cmd_super_weights(args):
+    sd = load_weights(args.weights)
+
+    target_suffixes = list(_DOWN_PROJ_SUFFIXES)
+    if args.include_o_proj:
+        aux_suffixes = list(_O_PROJ_SUFFIXES)
+    else:
+        aux_suffixes = []
+
+    ratio_threshold = float(args.ratio_threshold)
+    mad_threshold = float(args.mad_threshold)
+    max_report = int(args.max_report)
+
+    by_layer = {}
+    aux_projections = {}
+    skipped_layers = []
+
+    n_down_proj_scanned = 0
+    n_o_proj_scanned = 0
+
+    max_ratio = 0.0
+    earliest_layer_idx = None
+    top_layer = None
+    global_entries = []
+
+    def _matches(name, suffixes):
+        for suf in suffixes:
+            if name.endswith(suf):
+                return True
+        return False
+
+    for name, v in sd.items():
+        if not isinstance(v, torch.Tensor):
+            continue
+
+        is_primary = _matches(name, target_suffixes)
+        is_aux = (not is_primary) and _matches(name, aux_suffixes)
+        if not (is_primary or is_aux):
+            continue
+
+        # Quantized guard (before any float() cast)
+        if v.dtype in _QUANTIZED_DTYPES:
+            skipped_layers.append({"layer": name, "reason": "quantized_weight"})
+            continue
+
+        if v.dim() != 2:
+            skipped_layers.append({"layer": name, "reason": "not_2d"})
+            continue
+
+        W = v.float()
+
+        if torch.isnan(W).any().item() or torch.isinf(W).any().item():
+            skipped_layers.append({"layer": name, "reason": "nan_or_inf"})
+            continue
+
+        # Row-median absolute (robust center), shape (out, 1)
+        row_med_abs = W.abs().median(dim=1, keepdim=True).values
+        # MAD-based robust z-score from row median
+        row_med = W.median(dim=1, keepdim=True).values
+        row_mad = (W - row_med).abs().median(dim=1, keepdim=True).values
+        mad_scaled = (1.4826 * row_mad).clamp_min(1e-12)
+        z = (W - row_med).abs() / mad_scaled
+        ratio = W.abs() / row_med_abs.clamp_min(1e-12)
+        mask = (ratio >= ratio_threshold) & (z >= mad_threshold)
+
+        if is_primary:
+            n_down_proj_scanned += 1
+        else:
+            n_o_proj_scanned += 1
+
+        indices = mask.nonzero(as_tuple=False)
+        if indices.numel() == 0:
+            continue
+
+        outliers = []
+        for r, c in indices.tolist():
+            val = W[r, c].item()
+            ratio_val = ratio[r, c].item()
+            z_val = z[r, c].item()
+            status = "critical" if ratio_val >= 1000.0 else "warning"
+            outliers.append({
+                "row": r,
+                "col": c,
+                "value": round(val, 4),
+                "ratio_vs_row_median": round(ratio_val, 2),
+                "mad_z": round(z_val, 2),
+                "status": status,
+            })
+
+        # Sort by ratio desc
+        outliers.sort(key=lambda o: o["ratio_vs_row_median"], reverse=True)
+
+        if is_primary:
+            by_layer[name] = outliers
+        else:
+            aux_projections[name] = outliers
+
+        # Track global stats
+        layer_max_ratio = outliers[0]["ratio_vs_row_median"]
+        if layer_max_ratio > max_ratio:
+            max_ratio = layer_max_ratio
+            top_layer = name
+
+        layer_idx = _extract_layer_idx(name)
+        if layer_idx is not None:
+            if earliest_layer_idx is None or layer_idx < earliest_layer_idx:
+                earliest_layer_idx = layer_idx
+
+        for o in outliers:
+            global_entries.append({
+                "layer": name,
+                "row": o["row"],
+                "col": o["col"],
+                "value": o["value"],
+                "ratio_vs_row_median": o["ratio_vs_row_median"],
+            })
+
+    if n_down_proj_scanned == 0 and n_o_proj_scanned == 0:
+        emit_error(
+            "NoTargetMatricesFound",
+            "No FFN down_proj (or attention o_proj with --include-o-proj) matrices were detected in the state_dict.",
+            "Expected *.mlp.down_proj.weight or similar. Use 'tree' to inspect available layers.",
+        )
+
+    # Global top entries (flat, sorted by ratio desc, capped at max_report)
+    global_entries.sort(key=lambda e: e["ratio_vs_row_median"], reverse=True)
+    top_entries_global = global_entries[:max_report]
+
+    super_weights_found = sum(len(v) for v in by_layer.values()) \
+        + sum(len(v) for v in aux_projections.values())
+
+    scanned_layers = n_down_proj_scanned + n_o_proj_scanned
+
+    summary = {
+        "max_ratio": round(max_ratio, 2) if top_layer is not None else 0.0,
+        "earliest_layer_idx": earliest_layer_idx,
+        "n_down_proj_scanned": n_down_proj_scanned,
+        "n_o_proj_scanned": n_o_proj_scanned,
+        "top_layer": top_layer,
+        "top_entries_global": top_entries_global,
+    }
+
+    emit_result({
+        "weights": args.weights,
+        "ratio_threshold": ratio_threshold,
+        "mad_threshold": mad_threshold,
+        "include_o_proj": bool(args.include_o_proj),
+        "scanned_layers": scanned_layers,
+        "super_weights_found": super_weights_found,
+        "by_layer": by_layer,
+        "aux_projections": aux_projections,
+        "skipped_layers": skipped_layers,
+        "summary": summary,
+        "agent_hint": "Super weights are single scalars whose removal collapses the model. Ratios >= 1000x row-median in early mlp.down_proj layers (typically layers 1-3) are near-certain super weights per Yu et al. (Apple, 2024); pruning or quantizing them destroys generation quality.",
     })
 
 
@@ -1372,6 +1855,498 @@ def cmd_attention_plot(args):
         "agent_hint": f"HTML heatmap saved to '{os.path.abspath(out_path)}'. "
                       f"Tell the user to open it in a browser. "
                       f"The metrics above are the machine-readable equivalent."
+    })
+
+
+# --- LLM ACTIVATION DIAGNOSTICS ---
+
+def cmd_massive_activations(args):
+    model, input_tensor, tokens, is_causal = _load_model_for_analysis(args)
+
+    # Determine hidden_size to filter residual-stream-shaped tensors
+    hidden_size = None
+    try:
+        emb = model.get_input_embeddings()
+        if emb is not None and hasattr(emb, "weight"):
+            hidden_size = emb.weight.shape[1]
+    except Exception:
+        pass  # fall through; use hook-time filtering only
+
+    captured = {}  # name -> tensor (B, T, D)
+
+    def make_hook(name):
+        def hook(module, inputs, output):
+            t = output[0] if isinstance(output, (tuple, list)) else output
+            if not isinstance(t, torch.Tensor):
+                return
+            if t.dim() != 3:
+                return
+            D = t.shape[-1]
+            if D < 16:
+                return
+            if hidden_size is not None and D != hidden_size:
+                return
+            captured[name] = t.detach().float().cpu()
+        return hook
+
+    # Hook only block-looking modules first; fall back to all modules if none match.
+    BLOCK_SUFFIXES = ("Block", "DecoderLayer", "Layer", "TransformerBlock")
+    block_modules = [(n, m) for n, m in model.named_modules()
+                     if n and type(m).__name__.endswith(BLOCK_SUFFIXES)]
+
+    handles = []
+    if block_modules:
+        for n, m in block_modules:
+            handles.append(m.register_forward_hook(make_hook(n)))
+    else:
+        for n, m in model.named_modules():
+            if n:
+                handles.append(m.register_forward_hook(make_hook(n)))
+
+    with torch.no_grad():
+        _run_forward_safe(model, input_tensor)
+
+    for h in handles:
+        h.remove()
+
+    if not captured:
+        emit_error("NoResidualStreamCaptured",
+                   "No 3D activations with dim[-1]==hidden_size were captured during forward pass.",
+                   "The model may not expose a standard residual stream. Try running 'residual-stream' first to confirm hook visibility.")
+
+    abs_thr = args.abs_threshold
+    ratio_thr = args.ratio_threshold
+    top_k = args.top_k
+
+    layers_out = {}
+    total_massive = 0
+    max_ratio_global = 0.0
+    first_layer_with_massive = None
+    last_layer_with_massive = None
+    n_flagged = 0
+
+    for name in sorted(captured.keys()):
+        h = captured[name]
+        a = h.abs()
+        max_abs = a.max().item()
+        med_abs = a.median().item()
+        ratio = max_abs / (med_abs + 1e-9)
+        mask_count = ((a >= abs_thr) & (a >= ratio_thr * med_abs)).sum().item()
+        num_massive = int(mask_count)
+
+        # Top-K outliers by absolute value
+        B, T, D = h.shape
+        flat_vals = h.flatten()
+        flat_abs = a.flatten()
+        k = min(top_k, flat_abs.numel())
+        vals, idxs = torch.topk(flat_abs, k=k)
+
+        top_outliers = []
+        for v_abs, flat_idx in zip(vals.tolist(), idxs.tolist()):
+            if v_abs < abs_thr:
+                break  # nothing more worth reporting
+            rem = flat_idx % (T * D)
+            t_pos = rem // D
+            d_idx = rem % D
+            top_outliers.append({
+                "token": int(t_pos),
+                "feature": int(d_idx),
+                "value": round(float(flat_vals[flat_idx].item()), 4),
+                "abs_value": round(float(v_abs), 4),
+            })
+
+        status = "ok"
+        if num_massive > 0:
+            status = "critical"
+            if first_layer_with_massive is None:
+                first_layer_with_massive = name
+            last_layer_with_massive = name
+            total_massive += num_massive
+            n_flagged += 1
+
+        if ratio > max_ratio_global:
+            max_ratio_global = ratio
+
+        layers_out[name] = {
+            "max_abs": round(max_abs, 4),
+            "median_abs": round(med_abs, 6),
+            "ratio": round(ratio, 2),
+            "num_massive": num_massive,
+            "top_outliers": top_outliers,
+            "status": status,
+        }
+
+    emit_result({
+        "input_shape": list(input_tensor.shape),
+        "causal_masking_applied": is_causal,
+        "abs_threshold": abs_thr,
+        "ratio_threshold": ratio_thr,
+        "layers_hooked": len(captured),
+        "layers": layers_out,
+        "summary": {
+            "n_layers": len(layers_out),
+            "n_flagged": n_flagged,
+            "total_massive_scalars": total_massive,
+            "max_ratio_global": round(max_ratio_global, 2),
+            "first_layer_with_massive": first_layer_with_massive,
+            "last_layer_with_massive": last_layer_with_massive,
+        },
+        "agent_hint": "Massive activations (|a|>=100 AND |a|>=1000*median) concentrated on specific tokens/features across mid-to-late layers are EXPECTED in healthy decoder LLMs (Sun et al. 2024). Their absence in mid/late layers or sudden disappearance between checkpoints indicates training pathology or aggressive quantization damage."
+    })
+
+
+def _dormant_strip_suffix(name, suffixes):
+    for s in suffixes:
+        if name.endswith(s):
+            return name[: -len(s)]
+    return None
+
+
+def _dormant_attn_parent(attn_name):
+    stripped = _dormant_strip_suffix(attn_name, _DORMANT_ATTN_SUFFIXES)
+    return stripped if stripped is not None else attn_name
+
+
+def _dormant_match_v(parent, attn_name, v_store):
+    if parent in v_store:
+        return v_store[parent]
+    if attn_name in v_store:
+        return v_store[attn_name]
+    for vk, vt in v_store.items():
+        if parent and (parent.startswith(vk) or vk.startswith(parent)):
+            return vt
+    return None
+
+
+def _dormant_head_split_v(V, H):
+    """Reshape (B, T, D_v) -> (B, H, T, d_head), handling GQA/MQA.
+
+    Returns (V_h, n_kv_heads) or (None, None) on failure.
+    """
+    Bv, Tv, Dv = V.shape
+    if H > 0 and Dv % H == 0:
+        d_head = Dv // H
+        V_h = V.view(Bv, Tv, H, d_head).permute(0, 2, 1, 3).contiguous()
+        return V_h, H
+    for h_try in (H // 2, H // 4, H // 8, 1):
+        if h_try is None or h_try <= 0:
+            continue
+        if Dv % h_try == 0 and (Dv // h_try) in _DORMANT_DHEAD_CANDIDATES:
+            d_head = Dv // h_try
+            V_h = V.view(Bv, Tv, h_try, d_head).permute(0, 2, 1, 3).contiguous()
+            if H % h_try == 0:
+                V_h = V_h.repeat_interleave(H // h_try, dim=1)
+                return V_h, h_try
+    return None, None
+
+
+def _dormant_layer_status(dormant_count, n_heads):
+    if n_heads <= 0:
+        return "ok"
+    frac = dormant_count / n_heads
+    if frac > 0.3:
+        return "critical"
+    if dormant_count > 0:
+        return "warning"
+    return "ok"
+
+
+def _dormant_weights_only(args):
+    sd = load_weights(args.weights)
+    threshold = args.dormancy_threshold
+    num_heads_override = args.num_heads
+
+    v_entries = {}
+    o_entries = {}
+    for key, tensor in sd.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if tensor.dim() != 2:
+            continue
+        if not key.endswith(".weight"):
+            continue
+        base = key[: -len(".weight")]
+        vp = _dormant_strip_suffix(base, _DORMANT_V_SUFFIXES)
+        if vp is not None:
+            v_entries[vp] = tensor.detach().float()
+            continue
+        op = _dormant_strip_suffix(base, _DORMANT_O_SUFFIXES)
+        if op is not None:
+            o_entries[op] = tensor.detach().float()
+
+    if not v_entries:
+        emit_error("NoAttentionCaptured",
+                   "No v_proj-like weight tensors found in the state_dict.",
+                   "Provide a checkpoint containing attention value/output projections, "
+                   "or run without --weights-only to use forward-pass activations.")
+
+    layers_out = {}
+    total_heads = 0
+    total_dormant = 0
+    layer_medians = []
+    max_dormant_pct = 0.0
+
+    for parent, W_V in sorted(v_entries.items()):
+        W_O = o_entries.get(parent)
+        D_out_v, D_in_v = W_V.shape
+        H = num_heads_override
+        if H is None:
+            for h_try in (32, 16, 12, 8, 4, 2, 1):
+                if D_out_v % h_try == 0 and (D_out_v // h_try) in _DORMANT_DHEAD_CANDIDATES:
+                    H = h_try
+                    break
+        if H is None or D_out_v % H != 0:
+            layers_out[parent] = {
+                "status": "error",
+                "reason": f"Cannot infer num_heads for W_V shape {list(W_V.shape)}; pass --num-heads.",
+            }
+            continue
+
+        d_head = D_out_v // H
+        W_V_heads = W_V.view(H, d_head, D_in_v)
+        v_norms = W_V_heads.reshape(H, -1).norm(dim=-1)
+
+        if W_O is not None and W_O.dim() == 2 and W_O.shape[1] == H * d_head:
+            W_O_heads = W_O.view(W_O.shape[0], H, d_head).permute(1, 0, 2).contiguous()
+            o_norms = W_O_heads.reshape(H, -1).norm(dim=-1)
+            head_scores = v_norms * o_norms
+            projection_mode = "post_W_O"
+        else:
+            head_scores = v_norms
+            projection_mode = "pre_W_O"
+
+        layer_median = head_scores.median().item()
+        heads = {}
+        if layer_median <= 1e-9:
+            for h in range(H):
+                heads[f"head_{h}"] = {
+                    "weight_score": round(head_scores[h].item(), 4),
+                    "relative_to_median": None,
+                    "is_dormant": False,
+                }
+            dormant_count = 0
+            status_layer = "warning"
+        else:
+            relative = head_scores / layer_median
+            is_dormant = relative < threshold
+            for h in range(H):
+                heads[f"head_{h}"] = {
+                    "weight_score": round(head_scores[h].item(), 4),
+                    "relative_to_median": round(relative[h].item(), 4),
+                    "is_dormant": bool(is_dormant[h].item()),
+                }
+            dormant_count = int(is_dormant.sum().item())
+            status_layer = _dormant_layer_status(dormant_count, H)
+
+        total_heads += H
+        total_dormant += dormant_count
+        layer_medians.append(layer_median)
+        max_dormant_pct = max(max_dormant_pct, dormant_count / max(H, 1) * 100.0)
+
+        layers_out[parent] = {
+            "n_heads": H,
+            "projection": projection_mode,
+            "layer_median_score": round(layer_median, 4),
+            "heads": heads,
+            "dormant_heads": dormant_count,
+            "status": status_layer,
+        }
+
+    mean_median = (sum(layer_medians) / len(layer_medians)) if layer_medians else 0.0
+    dormant_pct = (total_dormant / max(total_heads, 1)) * 100.0
+
+    emit_result({
+        "mode": "weights_only",
+        "dormancy_threshold": threshold,
+        "layers": layers_out,
+        "summary": {
+            "n_layers": len(layers_out),
+            "total_heads": total_heads,
+            "dormant_heads": total_dormant,
+            "dormant_pct": round(dormant_pct, 1),
+            "mean_layer_median_score": round(mean_median, 4),
+            "max_dormant_pct_any_layer": round(max_dormant_pct, 1),
+        },
+        "agent_hint": "Weights-only proxy: per-head score is ||W_V^(h)||_F * ||W_O^(h)||_F, flagged dormant below dormancy_threshold x layer median (Sanyal et al. 2025). Healthy pretrained LLMs show 8-15% dormant heads; >30% in a layer suggests under-trained or collapsed attention and safe-to-ablate candidates. For activation-based confirmation, rerun without --weights-only."
+    })
+
+
+def cmd_dormant_heads(args):
+    if args.weights_only:
+        _dormant_weights_only(args)
+        return
+
+    if not args.script or not args.model_class:
+        emit_error("MissingArgument",
+                   "Activation mode requires --script and --model-class.",
+                   "Either provide --script and --model-class for a forward pass, "
+                   "or pass --weights-only to use the weights-only proxy instead.")
+
+    model, input_tensor, tokens, is_causal = _load_model_for_analysis(args)
+
+    attn_store = {}
+    v_store = {}
+    w_o_store = {}
+
+    def make_attn_hook(name):
+        def hook(module, inp, out):
+            tensors = out if isinstance(out, (tuple, list)) else [out]
+            for t in tensors:
+                if isinstance(t, torch.Tensor) and _is_attention_shaped(t):
+                    attn_store[name] = t.detach().cpu().float()
+                    return
+        return hook
+
+    def make_v_hook(parent):
+        def hook(module, inp, out):
+            t = out[0] if isinstance(out, (tuple, list)) else out
+            if isinstance(t, torch.Tensor) and t.dim() == 3:
+                v_store[parent] = t.detach().cpu().float()
+        return hook
+
+    def make_qkv_hook(parent):
+        def hook(module, inp, out):
+            t = out[0] if isinstance(out, (tuple, list)) else out
+            if isinstance(t, torch.Tensor) and t.dim() == 3:
+                D = t.shape[-1]
+                if D % 3 == 0:
+                    v_store[parent] = t[..., -(D // 3):].detach().cpu().float()
+        return hook
+
+    handles = []
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        handles.append(module.register_forward_hook(make_attn_hook(name)))
+        vp = _dormant_strip_suffix(name, _DORMANT_V_SUFFIXES)
+        if vp is not None:
+            handles.append(module.register_forward_hook(make_v_hook(vp)))
+        fusedp = _dormant_strip_suffix(name, _DORMANT_QKV_FUSED)
+        if fusedp is not None:
+            handles.append(module.register_forward_hook(make_qkv_hook(fusedp)))
+        op = _dormant_strip_suffix(name, _DORMANT_O_SUFFIXES)
+        if op is not None and hasattr(module, "weight") and isinstance(module.weight, torch.Tensor) and module.weight.dim() == 2:
+            w_o_store[op] = module.weight.detach().cpu().float()
+
+    with torch.no_grad():
+        _run_forward_safe(model, input_tensor)
+
+    for h in handles:
+        h.remove()
+
+    if not attn_store:
+        emit_error("NoAttentionCaptured",
+                   "No post-softmax attention weight tensors found during forward pass.",
+                   "The model must expose attention weights (post-softmax, shape [batch, heads, seq, seq]) "
+                   "as part of its forward() output. Rerun with --weights-only for a weights-based proxy.")
+
+    layers_out = {}
+    total_heads = 0
+    total_dormant = 0
+    layer_medians = []
+    max_dormant_pct = 0.0
+    threshold = args.dormancy_threshold
+
+    for attn_name in sorted(attn_store.keys()):
+        A = attn_store[attn_name]
+        parent = _dormant_attn_parent(attn_name)
+        V = _dormant_match_v(parent, attn_name, v_store)
+        W_O = w_o_store.get(parent) or w_o_store.get(attn_name)
+
+        if is_causal:
+            A = _apply_causal_mask(A)
+        if A.dim() == 3:
+            A = A.unsqueeze(1)
+        B, H, T, _ = A.shape
+
+        if V is None:
+            layers_out[parent] = {
+                "n_heads": H,
+                "status": "fallback_weights_only",
+                "reason": "V tensor not identified for this layer",
+            }
+            continue
+
+        V_h, n_kv_heads = _dormant_head_split_v(V, H)
+        if V_h is None:
+            layers_out[parent] = {
+                "n_heads": H,
+                "status": "error",
+                "reason": f"V shape incompatible with H={H} (D_v={V.shape[-1]})",
+            }
+            continue
+
+        d_head = V_h.shape[-1]
+        head_out = torch.matmul(A, V_h)  # (B, H, T, d_head)
+
+        projection_mode = "pre_W_O"
+        if W_O is not None and W_O.dim() == 2 and W_O.shape[1] == H * d_head:
+            W_O_h = W_O.view(W_O.shape[0], H, d_head)
+            head_proj = torch.einsum("bhtd,ohd->bhto", head_out, W_O_h)
+            norm_per_token = head_proj.norm(dim=-1)  # (B, H, T)
+            projection_mode = "post_W_O"
+        else:
+            norm_per_token = head_out.norm(dim=-1)  # (B, H, T)
+
+        head_norm = norm_per_token.mean(dim=(0, 2))  # (H,)
+        layer_median = head_norm.median().item()
+        heads = {}
+
+        if layer_median <= 1e-9:
+            for h in range(H):
+                heads[f"head_{h}"] = {
+                    "output_norm": round(head_norm[h].item(), 4),
+                    "relative_to_median": None,
+                    "is_dormant": False,
+                }
+            dormant_count = 0
+            status_layer = "warning"
+        else:
+            relative = head_norm / layer_median
+            is_dormant = relative < threshold
+            for h in range(H):
+                heads[f"head_{h}"] = {
+                    "output_norm": round(head_norm[h].item(), 4),
+                    "relative_to_median": round(relative[h].item(), 4),
+                    "is_dormant": bool(is_dormant[h].item()),
+                }
+            dormant_count = int(is_dormant.sum().item())
+            status_layer = _dormant_layer_status(dormant_count, H)
+
+        total_heads += H
+        total_dormant += dormant_count
+        layer_medians.append(layer_median)
+        max_dormant_pct = max(max_dormant_pct, dormant_count / max(H, 1) * 100.0)
+
+        layers_out[parent] = {
+            "n_heads": H,
+            "n_kv_heads": n_kv_heads,
+            "projection": projection_mode,
+            "layer_median_norm": round(layer_median, 4),
+            "heads": heads,
+            "dormant_heads": dormant_count,
+            "status": status_layer,
+        }
+
+    mean_median = (sum(layer_medians) / len(layer_medians)) if layer_medians else 0.0
+    dormant_pct = (total_dormant / max(total_heads, 1)) * 100.0
+
+    emit_result({
+        "causal_masking_applied": is_causal,
+        "mode": "activation",
+        "dormancy_threshold": threshold,
+        "input_tokens": tokens,
+        "attention_layers_found": len(attn_store),
+        "layers": layers_out,
+        "summary": {
+            "n_layers": len(layers_out),
+            "total_heads": total_heads,
+            "dormant_heads": total_dormant,
+            "dormant_pct": round(dormant_pct, 1),
+            "mean_layer_median_norm": round(mean_median, 4),
+            "max_dormant_pct_any_layer": round(max_dormant_pct, 1),
+        },
+        "agent_hint": "A head is dormant when its contribution norm (||A@V@W_O||) falls below dormancy_threshold x the layer median (Sanyal et al. 2025). Healthy pretrained LLMs show 8-15% dormant heads; >30% in a layer suggests under-trained or collapsed attention and safe-to-ablate candidates. Layers with status 'fallback_weights_only' had no matchable V; rerun with --weights-only for a complete per-layer weights-based picture."
     })
 
 
@@ -2009,7 +2984,6 @@ DESCRIPTION = f"""{BANNER}
   All output is machine-readable JSON.
 
 QUICK START:
-  python iride.py diagnose model.pt             Full health report
   python iride.py tree model.pt                 List layers
   python iride.py scan model.pt                 Bulk anomaly scan
   python iride.py attention \\
@@ -2022,13 +2996,15 @@ COMMANDS BY CATEGORY:
 
   Weight Inspection (static, no forward pass):
     tree            List all layers, shapes, dtypes, and parameter counts
-    diagnose        Full health report: verdict, score, action plan
     scan            Bulk stats + anomaly flags for every layer
     stats           Numerical statistics for a single layer
     histogram       Distribution bucketing, percentiles, shape analysis
     sparsity        Dead neuron detection, structured sparsity
     compare-init    Drift from Kaiming/Xavier/LeCun initialization
     svd             Rank, condition number, singular values
+    stable-rank     per-layer stable rank, effective rank, spectral entropy
+    qk-spectral     per-head Q @ K^T spectral norm; attention divergence risk
+    super-weights   outlier parameters in FFN down_proj (Yu et al. 2024)
     diff            Compare a layer between two checkpoints
 
   Transformer Analysis (dynamic, requires forward pass):
@@ -2036,6 +3012,8 @@ COMMANDS BY CATEGORY:
     attention       Per-head entropy, diagonality, verticality, patterns
     attention-plot  HTML heatmap with optional HF tokenizer labels
     run-forward     Per-layer activation stats (NaN/Inf tracing)
+    massive-activations  outlier hidden-state scalars (Sun et al. 2024)
+    dormant-heads   per-head output-norm dormancy (Sanyal et al. 2025)
 
   Interpretive Analysis (what the model is trying to do):
     scalars         Find and interpret all gates, scales, skip weights
@@ -2050,8 +3028,8 @@ COMMANDS BY CATEGORY:
     matmul          Multiply two weight matrices, report product rank
 
 EXAMPLES:
-  # One-shot diagnosis
-  python iride.py diagnose checkpoint.pt
+  # Bulk scan for anomalies across all layers
+  python iride.py scan checkpoint.pt
 
   # Drill into a flagged layer
   python iride.py histogram checkpoint.pt --layer "fc2.weight" --bins 30
@@ -2076,7 +3054,7 @@ NOTES:
   - Transformer commands auto-detect causal models and apply masking.
     Force with --causal true/false if auto-detection is wrong.
   - Primitives are cheap individually but add up. Prefer high-level commands
-    (diagnose, scan, attention) and only drop to primitives when needed.
+    (scan, attention) and only drop to primitives when needed.
 """
 
 
@@ -2109,15 +3087,6 @@ def main():
                   "Example:\n"
                   "  python iride.py tree checkpoint.pt")
     p.add_argument("weights", help="Path to the .pt / .pth file.")
-
-    p = _make_sub(subparsers, "diagnose",
-                  "Full automated health report with severity levels and action plan.",
-                  "Runs tree + scan + SVD + init-drift on every layer. Returns a\n"
-                  "verdict (HEALTHY / DEGRADED / BROKEN), a health score 0-100,\n"
-                  "and a prioritized action plan.\n\n"
-                  "Example:\n"
-                  "  python iride.py diagnose checkpoint.pt")
-    p.add_argument("weights", help="Path to the .pt file.")
 
     p = _make_sub(subparsers, "scan",
                   "Bulk stats + anomaly detection on ALL layers at once.",
@@ -2186,6 +3155,75 @@ def main():
     p.add_argument("--layer", required=True, help="Exact layer name.")
     p.add_argument("--flatten", action="store_true",
                    help="Reshape N-D tensors to 2D (flatten all dims after the first).")
+
+    p = _make_sub(subparsers, "stable-rank",
+                  "Per-layer stable rank, effective rank, spectral entropy.",
+                  "Weights-only scanner. For every 2D weight matrix W, computes:\n"
+                  "  - stable_rank  = ||W||_F^2 / sigma_max^2  (number of 'loud' dirs)\n"
+                  "  - effective_rank = exp(spectral entropy of normalized sigmas)\n"
+                  "  - srank_ratio / erank_ratio = normalized by min(shape)\n"
+                  "Flags rank-collapsed layers (stable_rank < 3 is critical).\n\n"
+                  "Skips 1D tensors, large embeddings (by default), and layers with\n"
+                  "min dim below --min-dim. Pass --flatten to include N-D tensors.\n\n"
+                  "Examples:\n"
+                  "  python iride.py stable-rank model.pt\n"
+                  "  python iride.py stable-rank model.pt --flatten --no-skip-embeddings")
+    p.add_argument("weights", help="Path to the .pt file.")
+    p.add_argument("--flatten", action="store_true",
+                   help="Reshape N-D tensors to 2D (flatten all dims after the first).")
+    p.add_argument("--skip-embeddings", action=argparse.BooleanOptionalAction, default=True,
+                   help="Skip likely embedding tables (name contains 'embed' and max dim > --embed-threshold). Default: on.")
+    p.add_argument("--min-dim", type=int, default=8,
+                   help="Skip matrices where min(shape) is below this (default: 8).")
+    p.add_argument("--embed-threshold", type=int, default=32768,
+                   help="Max-dim threshold above which an 'embed'-named tensor is treated as an embedding table (default: 32768).")
+
+    p = _make_sub(subparsers, "qk-spectral",
+                  "Per-head Q@K^T spectral norm; attention divergence risk.",
+                  "Weights-only scanner. For every attention layer with Q/K projections\n"
+                  "(separate q_proj/k_proj or fused c_attn/qkv_proj), computes per-head\n"
+                  "spectral norm sigma_max(W_Q W_K^T) / sqrt(d_head). Values above\n"
+                  "--flag-threshold predict attention entropy collapse and loss spikes\n"
+                  "(Zhai 2023, Takase 2025, OLMo 2 2025).\n\n"
+                  "Handles GQA/MQA (K heads fewer than Q heads) and fused QKV layouts.\n"
+                  "num_heads is inferred from d_model when possible; pass --num-heads\n"
+                  "if the model uses non-standard d_head values.\n\n"
+                  "Examples:\n"
+                  "  python iride.py qk-spectral model.pt\n"
+                  "  python iride.py qk-spectral model.pt --num-heads 32 --flag-threshold 100")
+    p.add_argument("weights", help="Path to the .pt file.")
+    p.add_argument("--num-heads", type=int, default=None,
+                   help="Number of attention (Q) heads. If omitted, inferred from d_model (tries d_head in {64,96,128,80,256}).")
+    p.add_argument("--flag-threshold", type=float, default=100.0,
+                   help="Per-head sigma_max threshold for 'critical' (default: 100.0). Half this value flags 'warning'.")
+
+    p = _make_sub(subparsers, "super-weights",
+                  "Outlier FFN parameters: single-scalar super weights (Yu et al. 2024).",
+                  "Weights-only scanner for 'super weights' -- individual parameters in\n"
+                  "FFN down-projection matrices whose removal catastrophically collapses\n"
+                  "model quality (Yu et al., 'The Super Weight in Large Language Models',\n"
+                  "ICLR 2025, arXiv 2411.07191).\n\n"
+                  "For each row of W, computes:\n"
+                  "  - ratio_vs_row_median = |W[r,c]| / median(|W[r,:]|)\n"
+                  "  - mad_z = |W[r,c] - median(W[r,:])| / (1.4826 * MAD)\n"
+                  "Flags entries where both exceed thresholds. Ratios >= 1000x are\n"
+                  "'critical' (near-certain super weights); otherwise 'warning'.\n\n"
+                  "Scans *.mlp.down_proj.weight / *.mlp.c_proj.weight / *.feed_forward.w2.weight\n"
+                  "and friends. Pass --include-o-proj to also scan attention output\n"
+                  "projections.\n\n"
+                  "Examples:\n"
+                  "  python iride.py super-weights model.pt\n"
+                  "  python iride.py super-weights model.pt --include-o-proj\n"
+                  "  python iride.py super-weights model.pt --ratio-threshold 200 --mad-threshold 75")
+    p.add_argument("weights", help="Path to the .pt file.")
+    p.add_argument("--ratio-threshold", type=float, default=100.0,
+                   help="Min |W[r,c]| / row-median-abs ratio to flag (default: 100.0). >=1000 is 'critical'.")
+    p.add_argument("--mad-threshold", type=float, default=50.0,
+                   help="Min MAD-based robust z-score to flag (default: 50.0).")
+    p.add_argument("--max-report", type=int, default=20,
+                   help="Max number of top global entries to include in summary (default: 20).")
+    p.add_argument("--include-o-proj", action="store_true",
+                   help="Also scan attention output projections (*.self_attn.o_proj.weight, *.attn.c_proj.weight, etc.).")
 
     p = _make_sub(subparsers, "diff",
                   "Compare a layer between two checkpoints.",
@@ -2261,6 +3299,72 @@ def main():
     p.add_argument("--weights", required=True, help="Path to the .pt weights file.")
     p.add_argument("--input-shape", required=True,
                    help="Comma-separated input shape, e.g. 1,3,224,224.")
+
+    p = _make_sub(subparsers, "massive-activations",
+                  "Detect outlier scalars in the residual stream (Sun et al. 2024).",
+                  "Forward-pass detector of 'massive activations' -- individual hidden-state\n"
+                  "scalars whose magnitude is orders larger than the median of the tensor\n"
+                  "(Sun et al., 'Massive Activations in Large Language Models', COLM 2024,\n"
+                  "arXiv 2402.17762). In healthy decoder LLMs these appear on specific\n"
+                  "tokens/features in mid-to-late layers and are essential to the model's\n"
+                  "behavior. Their absence or disappearance between checkpoints indicates\n"
+                  "training pathology or aggressive quantization damage.\n\n"
+                  "Hooks block-like modules (Block / DecoderLayer / TransformerBlock) first\n"
+                  "and falls back to all modules if none match. Filters hooks to 3D outputs\n"
+                  "whose last dim equals the input-embedding hidden size. For each captured\n"
+                  "tensor, flags entries where |a| >= --abs-threshold AND |a| >= --ratio-threshold * median(|a|).\n\n"
+                  "Examples:\n"
+                  "  python iride.py massive-activations \\\n"
+                  "    --script model.py --model-class LlamaForCausalLM \\\n"
+                  "    --weights model.pt --tokenizer gpt2 --text \"Hello world\"\n"
+                  "  python iride.py massive-activations \\\n"
+                  "    --script model.py --model-class GPT \\\n"
+                  "    --weights model.pt --input-shape 1,128 \\\n"
+                  "    --abs-threshold 50 --ratio-threshold 500 --top-k 20")
+    _add_analysis_args(p)
+    p.add_argument("--abs-threshold", type=float, default=100.0,
+                   help="Min absolute value for a scalar to count as 'massive' (default: 100.0).")
+    p.add_argument("--ratio-threshold", type=float, default=1000.0,
+                   help="Min |a| / median(|a|) ratio for a scalar to count as 'massive' (default: 1000.0).")
+    p.add_argument("--top-k", type=int, default=10,
+                   help="Max outliers to report per layer (default: 10).")
+
+    p = _make_sub(subparsers, "dormant-heads",
+                  "Per-head output-norm dormancy detector (Sanyal et al. 2025).",
+                  "Identifies inactive attention heads by the L2 norm of their\n"
+                  "per-head output contribution (Sanyal et al., 'Identifying and\n"
+                  "Evaluating Inactive Heads in Pretrained LLMs', arXiv 2504.03889, 2025).\n\n"
+                  "Default (activation) mode runs a forward pass, captures A and V per\n"
+                  "layer, optionally projects through a W_O slice, and computes\n"
+                  "head_norm = ||A @ V [@ W_O^(h)]||_2 averaged over batch/tokens. A\n"
+                  "head is flagged as dormant when head_norm < --dormancy-threshold x\n"
+                  "the layer median. Use --weights-only to skip the forward pass and\n"
+                  "use the weights-only proxy ||W_V^(h)||_F * ||W_O^(h)||_F instead.\n\n"
+                  "Examples:\n"
+                  "  python iride.py dormant-heads \\\n"
+                  "    --script model.py --model-class LlamaForCausalLM \\\n"
+                  "    --weights model.pt --tokenizer gpt2 --text \"Hello world\"\n"
+                  "  python iride.py dormant-heads --weights model.pt --weights-only\n"
+                  "  python iride.py dormant-heads --weights model.pt --weights-only \\\n"
+                  "    --num-heads 12 --dormancy-threshold 0.05")
+    p.add_argument("--script", default=None,
+                   help="Python file containing the Model class (not needed with --weights-only).")
+    p.add_argument("--model-class", default=None,
+                   help="Name of the PyTorch Module class (not needed with --weights-only).")
+    p.add_argument("--weights", required=True, help="Path to the .pt weights file.")
+    p.add_argument("--input-shape", default=None,
+                   help="Shape of dummy input, e.g. 1,128 (not needed if --text is used).")
+    p.add_argument("--tokenizer", default=None,
+                   help="HuggingFace tokenizer name (e.g. 'gpt2'). Required with --text.")
+    p.add_argument("--text", default=None, help="Input text string. Requires --tokenizer.")
+    p.add_argument("--causal", choices=["auto", "true", "false"], default="auto",
+                   help="Causal masking: 'auto' detects from model class, 'true'/'false' forces it.")
+    p.add_argument("--dormancy-threshold", type=float, default=0.1,
+                   help="Fraction of the layer median below which a head is flagged as dormant (default: 0.1).")
+    p.add_argument("--weights-only", action="store_true",
+                   help="Skip the forward pass and use the weights-only proxy ||W_V||_F * ||W_O||_F.")
+    p.add_argument("--num-heads", type=int, default=None,
+                   help="Override num_heads inference (required with --weights-only when inference fails).")
 
     # ── Composable Primitives ────────────────────────────────────────
 
@@ -2378,18 +3482,22 @@ def main():
 
     dispatch = {
         "tree": cmd_tree,
-        "diagnose": cmd_diagnose,
         "scan": cmd_scan,
         "stats": cmd_stats,
         "histogram": cmd_histogram,
         "sparsity": cmd_sparsity,
         "compare-init": cmd_compare_init,
         "svd": cmd_svd,
+        "stable-rank": cmd_stable_rank,
+        "qk-spectral": cmd_qk_spectral,
+        "super-weights": cmd_super_weights,
         "diff": cmd_diff,
         "residual-stream": cmd_residual_stream,
         "attention": cmd_attention,
         "attention-plot": cmd_attention_plot,
         "run-forward": cmd_run_forward,
+        "massive-activations": cmd_massive_activations,
+        "dormant-heads": cmd_dormant_heads,
         "slice": cmd_slice,
         "topk": cmd_topk,
         "cosine": cmd_cosine,
