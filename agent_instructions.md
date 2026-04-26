@@ -35,8 +35,7 @@ If the plot's underlying input was a random / synthetic batch, the human MUST be
 Prefer to embed the metric pseudocode and input description directly inside the HTML plot when the command supports it. When it does not, put the same information in the chat alongside the "open this in a browser" instruction.
 
 Workflow:
-- Start with `diagnose` for an instant full health report with prioritized action plan.
-- Or start with `tree` to understand the architecture, then `scan` for bulk anomaly detection.
+- Start with `tree` to understand the architecture, then `scan` for bulk anomaly detection.
 - Drill down with `stats`, `svd`, `histogram`, or `sparsity` on flagged layers.
 - Use `compare-init` to check if weights have drifted from initialization.
 - Use `diff` to compare two checkpoints of the same model.
@@ -61,30 +60,21 @@ Use this first to find the exact string keys for the layers.
     python iride.py tree checkpoint.pt
 
 
-2. Full Health Report (diagnose)
-
-The master command. Runs tree + scan + SVD + init-drift analysis on every layer automatically. Returns a verdict (HEALTHY/DEGRADED/BROKEN), a health score, and a prioritized action plan.
-
-    python iride.py diagnose checkpoint.pt
-
-Agent workflow: Start here. If verdict is HEALTHY, you're done. If DEGRADED or BROKEN, follow the action_plan in the JSON output.
-
-
-3. Bulk Scan with Anomaly Detection (scan)
+2. Bulk Scan with Anomaly Detection (scan)
 
 Runs stats on ALL layers at once and flags anomalies (constant tensors, exploding weights, NaN/Inf, dead layers). Returns per-layer status (ok/warning/critical) and next_steps.
 
     python iride.py scan checkpoint.pt
 
 
-4. Layer Statistics (stats)
+3. Layer Statistics (stats)
 
 Detailed numerical statistics for a single layer.
 
     python iride.py stats checkpoint.pt --layer "transformer.h.0.attn.c_proj.weight"
 
 
-5. Weight Distribution Histogram (histogram)
+4. Weight Distribution Histogram (histogram)
 
 Bucket values into bins with percentiles, skewness, kurtosis, and distribution type detection (normal/degenerate/heavy-tailed/bimodal).
 
@@ -92,7 +82,7 @@ Bucket values into bins with percentiles, skewness, kurtosis, and distribution t
     python iride.py histogram checkpoint.pt --layer "fc1.weight" --bins 30
 
 
-6. Dead Neuron & Structured Sparsity Analysis (sparsity)
+5. Dead Neuron & Structured Sparsity Analysis (sparsity)
 
 Per-neuron analysis: dead rows (output neurons), dead columns (input features), weakest neurons by L2 norm. Works on biases and conv filters too.
 
@@ -100,7 +90,7 @@ Per-neuron analysis: dead rows (output neurons), dead columns (input features), 
     python iride.py sparsity checkpoint.pt --layer "conv1.weight" --threshold 1e-4
 
 
-7. Compare Weights vs Initialization (compare-init)
+6. Compare Weights vs Initialization (compare-init)
 
 Compares every weight matrix against Kaiming/Xavier/LeCun expected distributions. Reports drift_ratio and status: dead, shrunk, near_init, trained, high_drift, exploded.
 
@@ -108,7 +98,7 @@ Compares every weight matrix against Kaiming/Xavier/LeCun expected distributions
     python iride.py compare-init checkpoint.pt --init kaiming
 
 
-8. Singular Value Decomposition (svd)
+7. Singular Value Decomposition (svd)
 
 Compute rank, condition number, singular values. If the layer is Conv2D (4D tensor), you MUST use --flatten.
 
@@ -116,11 +106,64 @@ Compute rank, condition number, singular values. If the layer is Conv2D (4D tens
     python iride.py svd checkpoint.pt --layer "conv1.weight" --flatten
 
 
-9. Compare Checkpoints (diff)
+8. Compare Checkpoints (diff)
 
 Check if a layer changed between two checkpoints. l2_distance=0 means frozen gradients.
 
     python iride.py diff epoch_1.pt epoch_2.pt --layer "fc1.bias"
+
+
+9. Stable Rank & Effective Rank (stable-rank)
+
+Weights-only scan of every 2D weight matrix. Computes stable rank (||W||_F^2 / sigma_max^2), effective rank (exp of spectral entropy), and their ratios to min(shape). Flags rank collapse.
+
+    python iride.py stable-rank checkpoint.pt
+    python iride.py stable-rank checkpoint.pt --flatten --no-skip-embeddings
+
+Key output fields:
+- layers[name].stable_rank: effective number of "loud" singular directions
+- layers[name].effective_rank: exp(spectral entropy); counts directions by energy share
+- layers[name].srank_ratio / erank_ratio: normalized by min(shape); ratios much less than 1 indicate rank collapse
+- layers[name].status: "ok" | "warning" (srank_ratio < 0.1 or erank_ratio < 0.5) | "critical" (stable_rank < 3)
+- summary.worst_layer + worst_srank_ratio: inspect this layer first
+
+
+10. QK Spectral Norm (qk-spectral)
+
+Weights-only per-head spectral norm of W_Q @ W_K^T / sqrt(d_head) for every attention layer. High values predict attention entropy collapse and loss spikes (Zhai 2023, Takase 2025, OLMo 2 2025). Handles separate Q/K projections, fused QKV (GPT-2 c_attn, Qwen qkv_proj, BLOOM Wqkv), and GQA/MQA (num_kv_heads less than num_heads). num_heads is inferred from d_model when possible; pass --num-heads otherwise.
+
+    python iride.py qk-spectral checkpoint.pt
+    python iride.py qk-spectral checkpoint.pt --num-heads 32 --flag-threshold 100
+
+Key output fields:
+- layers[name].per_head_sigma: list of per-head sigma_max values, scaled by 1/sqrt(d_head)
+- layers[name].max_sigma / mean_sigma: aggregate per layer
+- layers[name].num_heads / num_kv_heads / d_head: resolved head geometry
+- layers[name].fused: true if derived from a fused c_attn / qkv_proj weight
+- layers[name].critical_heads / warning_heads: counts above thresholds
+- layers[name].status: "ok" | "warning" (sigma > 0.5 * flag_threshold) | "critical" (sigma > flag_threshold)
+- summary.global_max_sigma / global_max_layer / global_max_head: where divergence risk is highest
+- summary.unresolved_layers: Q/K candidates that could not be resolved (missing pair, bad shape, etc.)
+
+
+11. Super Weight Detection (super-weights)
+
+Weights-only detector for 'super weights' -- individual scalar parameters in FFN down-projection matrices whose removal catastrophically collapses model quality (Yu et al., "The Super Weight in Large Language Models", ICLR 2025, arXiv 2411.07191). For each row of W, flags entries where both |W[r,c]| / median(|W[r,:]|) exceeds --ratio-threshold AND the MAD-based robust z-score exceeds --mad-threshold. Scans *.mlp.down_proj.weight, *.mlp.c_proj.weight, *.feed_forward.w2.weight and friends; pass --include-o-proj to also scan attention output projections.
+
+    python iride.py super-weights checkpoint.pt
+    python iride.py super-weights checkpoint.pt --include-o-proj
+    python iride.py super-weights checkpoint.pt --ratio-threshold 200 --mad-threshold 75
+
+Key output fields:
+- by_layer[name]: list of outlier entries per primary layer, sorted by ratio_vs_row_median desc
+  - each entry: {row, col, value, ratio_vs_row_median, mad_z, status}
+  - status: "critical" (ratio >= 1000) | "warning" (otherwise)
+- aux_projections[name]: same shape as by_layer, populated only when --include-o-proj
+- skipped_layers: target matches skipped for reason "quantized_weight" | "not_2d" | "nan_or_inf"
+- summary.max_ratio / top_layer: the single largest ratio observed and where
+- summary.earliest_layer_idx: smallest layer index containing a super weight (super weights typically cluster in layers 1-3)
+- summary.top_entries_global: flat list of the top --max-report entries across all layers
+- super_weights_found: total count across by_layer + aux_projections
 
 
 ---
@@ -140,7 +183,7 @@ These commands dynamically load a model, run a forward pass, and capture interna
 IMPORTANT ON CAUSAL MASKING: If the model is a decoder (GPT, LLaMA, Mistral, etc.), causal masking is NOT optional. It MUST be applied or attention analysis will be wrong. The tool auto-detects causal models from class name and config. If auto-detection fails for a known causal model, you MUST pass --causal true. Never analyze a causal model's attention without masking.
 
 
-10. Residual Stream Analysis (residual-stream)
+12. Residual Stream Analysis (residual-stream)
 
 Traces how hidden states evolve through the model. Captures norm growth, cosine similarity between consecutive layers, update ratios, and per-position variance. Detects norm explosion, collapse, and dead layers.
 
@@ -160,7 +203,7 @@ Key metrics to watch:
 - per_position_variance: decreasing = representation collapse
 
 
-11. Attention Head Analysis (attention)
+13. Attention Head Analysis (attention)
 
 Captures post-softmax attention weights from every head. Computes per-head entropy, diagonality, verticality, pattern classification, and top attention pairs.
 
@@ -184,7 +227,7 @@ Per-head metrics:
 - top_pairs: strongest attention connections (with token labels if tokenizer used)
 
 
-12. Attention Heatmap Visualization (attention-plot)
+14. Attention Heatmap Visualization (attention-plot)
 
 Generates a self-contained HTML heatmap for a specific layer and head. Returns both the HTML file path (for the user to open in a browser) and machine-readable metrics in JSON.
 
@@ -204,7 +247,7 @@ Use `attention` first to identify interesting heads, then `attention-plot` to vi
 IMPORTANT: obey the Plot Transparency Rule from the Core Rules section. When you hand this HTML to the human, also tell them in chat: what the heatmap shows (attention weights, rows = query positions, columns = key positions), the metric as pseudocode (softmax_j(Q_i K_j^T / sqrt(d_k)), with causal mask if is_causal), and the input (real tokens vs synthetic --input-shape, batch/seq size). If you used a random input, flag it.
 
 
-13. Dynamic Forward Pass Inspection (run-forward)
+15. Dynamic Forward Pass Inspection (run-forward)
 
 Captures activation statistics from every layer during a forward pass. Use when weights look fine but inference produces NaN/Inf.
 
@@ -213,97 +256,71 @@ Captures activation statistics from every layer during a forward pass. Use when 
       --weights checkpoint.pt --input-shape 1,128
 
 
-13a. MLP Column Usage (mlp-usage)
+16. Massive Activations (massive-activations)
 
-Treats every column of W_up as a "memory neuron" (Geva 2020: FFN layers as key-value memories). For each MLP, runs a forward pass, hooks the up-projection, applies the activation, and reports per-column usage stats.
+Forward-pass detector of outlier scalars in the residual stream (Sun et al., "Massive Activations in Large Language Models", COLM 2024, arXiv 2402.17762). Hooks every transformer block, captures the 3D hidden state, and flags individual entries whose absolute value is both above an absolute floor AND orders larger than the median of the tensor.
 
-    python iride.py mlp-usage \
+    python iride.py massive-activations \
+      --script model.py --model-class LlamaForCausalLM \
+      --weights checkpoint.pt --tokenizer gpt2 --text "Hello world"
+
+    # Custom thresholds and more outliers per layer
+    python iride.py massive-activations \
       --script model.py --model-class GPT \
-      --weights model.pt --input-shape 4,512
+      --weights checkpoint.pt --input-shape 1,128 \
+      --abs-threshold 50 --ratio-threshold 500 --top-k 20
 
-    python iride.py mlp-usage \
-      --script model.py --model-class GPT \
-      --weights model.pt --text "The cat sat on" --tokenizer gpt2 \
-      --activation relu2
+Key arguments:
+- --abs-threshold (default 100.0): min |a| to count as massive.
+- --ratio-threshold (default 1000.0): min |a| / median(|a|) to count as massive.
+- --top-k (default 10): max outliers to report per layer.
 
-Per-column metrics returned (as summary stats + top/bottom lists, never raw arrays):
-- activation_fraction: P(|h_j| > threshold). Near zero = dead neuron. Near one = superneuron.
-- post_mean: E[h_j] after activation. Magnitude of typical firing.
-- contribution: E[|h_j|] * ||W_down[:, j]||. The honest "impact on output" metric. A neuron
-  that fires loudly but whose W_down column is near-zero moves nothing.
-- dead_count / super_count: based on activation_fraction thresholds (0.01 and 0.95).
-- gini in [0, 1]: 0 = every neuron carries equal load, 1 = all load on one neuron.
-- normalized_usage_entropy: 1.0 = flat use, <0.5 = sharply peaked.
-- top_neurons / bottom_neurons: indices sorted by contribution.
+Key output fields:
+- layers: per-block dict with max_abs, median_abs, ratio, num_massive, top_outliers, status (ok | critical).
+- summary: n_flagged, total_massive_scalars, max_ratio_global, first/last layer with massive activations.
+- Each top_outlier gives token index, feature index, raw value, and absolute value.
 
-Auto-detects MLP up-projections by: (a) module name keywords (fc1, c_fc, w_up, up_proj,
-gate_proj, intermediate, ...) AND/OR (b) shape (out >= in * expansion_threshold).
-Attention-like names (q_proj, kv, c_attn, ...) are excluded.
-
-Override auto-detection with --mlp-pattern '<regex>' (run `tree` first to find module names).
-
-Activation choices: relu2 (default), relu, gelu, silu, leakyrelu2, identity.
-Use --activation identity when the hook captures already-activated values (fused MLP blocks).
-
---no-w-down disables the W_down weighting; contribution becomes just E[|h_j|].
-
-Agent workflow: use mlp-usage to detect (a) wasted capacity from dead columns, (b) over-shared
-generic neurons via super_count (candidates for a shared-prefix cache across layers), and
-(c) which specific columns drive the output via top_neurons. High gini with low dead_count
-means the layer has found specialists; low gini across the board means undifferentiated usage.
+What to look for:
+- Massive activations concentrated on specific tokens/features across mid-to-late layers are EXPECTED in healthy decoder LLMs. They implement an attention-sink-like mechanism and carry information essential for generation.
+- Absence of massive activations in mid/late layers of a supposedly trained decoder LLM, or a sudden drop between two checkpoints, indicates training pathology or aggressive quantization damage (outlier clipping).
+- The exact tokens/features carrying the outlier are stable across inputs in a healthy model -- inspect `top_outliers` across a couple of different texts to confirm.
 
 
-13b. MLP Usage Heatmap (mlp-usage-plot)
 
-Same analysis as mlp-usage but renders an HTML heatmap (one row per MLP layer, one cell
-per memory neuron). Dark blue = dead, cyan = moderate, red = heavily used. The visual analog
-of `attention-plot` but for MLP memory.
+17. Dormant Heads (dormant-heads)
 
-    python iride.py mlp-usage-plot \
-      --script model.py --model-class GPT \
-      --weights model.pt --text "The cat sat on" --tokenizer gpt2 \
-      --metric contribution --sort-by index
+Per-head dormancy detector based on the L2 norm of each head's contribution to the residual stream (Sanyal et al., "Identifying and Evaluating Inactive Heads in Pretrained LLMs", arXiv 2504.03889, 2025). Attention-weight-only definitions (e.g. entropy) are inadequate; the right metric is ||A @ V||_2 per head, optionally projected through the corresponding W_O slice.
 
-Metric choices:
-- contribution (default): E[|h_j|] * ||W_down[:, j]||
-- magnitude: E[|h_j|] post-activation
-- fraction: P(|h_j| > threshold)
+Default mode runs a forward pass: for each attention layer captures post-softmax A and the V output, reshapes V into per-head chunks (handling GQA/MQA via `repeat_interleave` and fused QKV projections by taking the last third of the last dim), applies causal masking if needed, then computes `head_norm = mean over batch and tokens of ||A @ V @ W_O^(h)||_2`. A head is flagged as dormant when head_norm is below `--dormancy-threshold` times the layer median. `--weights-only` skips the forward pass entirely and uses the proxy `||W_V^(h)||_F * ||W_O^(h)||_F`.
 
-Sort choices:
-- index (default): keep original column order; reveals spatial structure (shared-prefix
-  clustering near column 0, dead tails, periodic patterns, per-bank bands).
-- metric: sort each row descending; reveals the head/tail distribution.
+    # Activation mode
+    python iride.py dormant-heads \
+      --script model.py --model-class LlamaForCausalLM \
+      --weights checkpoint.pt --tokenizer gpt2 --text "Hello world"
 
---max-cols N (default 1024) caps cells per row; larger rows are stride-sampled.
+    # Weights-only mode (no forward pass)
+    python iride.py dormant-heads --weights checkpoint.pt --weights-only
 
-Output: mlp_usage_<metric>_<sort-by>.html written next to the checkpoint. The JSON response
-includes per_layer_summary (dead_count, super_count, gini, entropy, top_5_neurons) so the
-agent can reason without opening the HTML.
+    # Custom threshold and explicit num-heads
+    python iride.py dormant-heads --weights checkpoint.pt --weights-only \
+      --num-heads 12 --dormancy-threshold 0.05
 
-IMPORTANT: obey the Plot Transparency Rule from the Core Rules section. When you hand this HTML to the human, also tell them in chat:
+Key arguments:
+- --dormancy-threshold (default 0.1): fraction of the layer median below which a head is dormant.
+- --weights-only: skip forward pass, use weights-only proxy.
+- --num-heads: override head-count inference (required with --weights-only when inference fails).
+- --script / --model-class: required in activation mode only.
 
-  - WHAT the plot shows: one row per MLP layer, one cell per W_up output column ("memory neuron"); colour encodes the selected metric.
+Key output fields:
+- mode: "activation" or "weights_only".
+- layers: per-layer dict with n_heads, n_kv_heads (activation mode), projection ("pre_W_O" | "post_W_O"), layer_median_norm or layer_median_score, heads (output_norm or weight_score, relative_to_median, is_dormant), dormant_heads, status (ok | warning | critical | fallback_weights_only | error).
+- summary: n_layers, total_heads, dormant_heads, dormant_pct, mean_layer_median_norm (or score), max_dormant_pct_any_layer.
 
-  - The METRIC as pseudocode, exactly as computed. Depending on --metric and --activation:
-        scores[b, l, j] = (X W_up)[b, l, j]                  # captured pre-activation
-        h[b, l, j]      = activation(scores[b, l, j])        # e.g. relu(x)**2 for --activation relu2
-        # --metric fraction:
-        value[j] = mean_{b, l}( 1[ |h[b, l, j]| > act_threshold ] )
-        # --metric magnitude:
-        value[j] = mean_{b, l}( |h[b, l, j]| )
-        # --metric contribution (default):
-        value[j] = mean_{b, l}( |h[b, l, j]| ) * || W_down[:, j] ||_2
-     State the chosen activation, act_threshold (default 1e-6), and whether --no-w-down / --use-w-down was in effect.
-
-  - The INPUT: was it --text with a real tokenised prompt (say which prompt, how many tokens), or --input-shape with random noise (say so explicitly — synthetic input means the usage pattern is NOT the one seen during training, and dead / super counts may be misleading). For honest statistics the human wants a large batch of real-distribution tokens.
-
-  - The SORTING: --sort-by index keeps original neuron indices (x-axis is neuron id). --sort-by metric re-sorts each row descending (x-axis is rank, NOT neuron id — two rows at the same x position do NOT refer to the same neuron).
-
-  - Any stride-sampling from --max-cols if the MLP has more columns than the cap.
-
-A concrete example of the kind of line the agent should add to chat when presenting this plot:
-
-    "This heatmap shows MLP memory usage. Metric: E[|relu(X W_up)^2|] * ||W_down[:, j]||_2, computed over 128 random float tokens from --input-shape 4,32,64 (NOT real text — dead / super counts are only as meaningful as this synthetic batch). Rows = layers, columns = neuron index in original W_up order."
+What to look for:
+- Healthy pretrained LLMs typically show 8-15% dormant heads overall.
+- >30% dormant in a single layer flags under-trained or collapsed attention and marks safe-to-ablate candidates per Sanyal et al. 2025.
+- Fused QKV and GQA/MQA architectures are handled transparently; n_kv_heads reports the true value-head count.
+- Layers with `status: "fallback_weights_only"` had no matchable V tensor during the forward pass -- rerun with `--weights-only` to get a complete weights-based picture.
 
 
 ---
@@ -313,7 +330,7 @@ COMPOSABLE PRIMITIVES (low-level, stackable, weight-only)
 These are minimal single-purpose tools. Each does one thing and returns JSON. An agent can chain them to build custom analyses (e.g., manually computing OV circuits, comparing head subspaces, isolating specific neuron groups). They cost more tokens than high-level commands because multiple calls are needed. Only use them when the high-level commands don't answer your specific question.
 
 
-14. Slice — Extract a Sub-Tensor
+18. Slice — Extract a Sub-Tensor
 
     python iride.py slice checkpoint.pt --layer "fc1.weight" --index "0:10,5:15"
     python iride.py slice checkpoint.pt --layer "fc1.weight" --index ":,3"
@@ -322,7 +339,7 @@ These are minimal single-purpose tools. Each does one thing and returns JSON. An
 Numpy-style indexing. Returns stats on the extracted sub-tensor.
 
 
-15. Top-K Values — Find Outliers
+19. Top-K Values — Find Outliers
 
     python iride.py topk checkpoint.pt --layer "fc1.weight" --k 10
     python iride.py topk checkpoint.pt --layer "fc1.weight" --k 5 --smallest
@@ -330,7 +347,7 @@ Numpy-style indexing. Returns stats on the extracted sub-tensor.
 Returns values with multi-dimensional index coordinates.
 
 
-16. Cosine Similarity — Compare Two Layers
+20. Cosine Similarity — Compare Two Layers
 
     # Same file, different layers
     python iride.py cosine checkpoint.pt checkpoint.pt --layer1 "head.0.weight" --layer2 "head.1.weight"
@@ -341,7 +358,7 @@ Returns values with multi-dimensional index coordinates.
 Requires same total number of elements. Use `slice` first if shapes differ.
 
 
-17. Reduce — Aggregate Along a Dimension
+21. Reduce — Aggregate Along a Dimension
 
     python iride.py reduce checkpoint.pt --layer "fc1.weight" --dim 0 --op norm
     python iride.py reduce checkpoint.pt --layer "fc1.weight" --dim 1 --op mean
@@ -350,7 +367,7 @@ Operations: mean, sum, max, min, norm, var, absmax.
 dim=0 on weights = per-input-feature summary. dim=1 = per-output-neuron summary.
 
 
-18. Matrix Multiply — Compose Weight Matrices
+22. Matrix Multiply — Compose Weight Matrices
 
     # Compute Q @ K^T (need transpose on K)
     python iride.py matmul checkpoint.pt --layer1 "attn.q.weight" --layer2 "attn.k.weight" --transpose2
@@ -370,7 +387,7 @@ about its own architecture -- which layers it trusts, which it bypasses, how it
 distributes computation across depth.
 
 
-19. Scalar Parameter Analysis (scalars)
+23. Scalar Parameter Analysis (scalars)
 
 Finds ALL small learned parameters (gates, scales, temperatures, skip weights).
 Groups them by naming pattern, detects trends across depth, interprets sign patterns.
@@ -386,7 +403,7 @@ What to look for:
 - Near one = identity-initialized gates, barely moved from init
 
 
-20. Block Profile (block-profile)
+24. Block Profile (block-profile)
 
 Auto-detects repeating block structure and shows per-block comparison:
 weight stds, norm means, scalars, and how they trend from first to last block.
@@ -400,7 +417,7 @@ What to look for:
 - Norm mean changing across depth = model learned different scales for different layers
 
 
-21. Residual Stream Contributions (residual-contrib)
+25. Residual Stream Contributions (residual-contrib)
 
 Runs a forward pass and measures what each block ACTUALLY contributes to the
 residual stream. For each block: how much it changes the stream, and whether
@@ -506,7 +523,7 @@ The real insight comes from combining multiple signals:
 
 1. Run `scalars` -> find that middle blocks have negative gates
 2. Run `block-profile` -> find that middle block weight stds are lowest
-3. Run `residual-contrib` -> find that middle blocks are pass-through or correcting
+2. Run `residual-contrib` -> find that middle blocks are pass-through or correcting
 
 These three signals tell the SAME story: the middle blocks haven't learned useful
 features yet. The model is routing around them. This is expected in early training.
@@ -514,7 +531,7 @@ features yet. The model is routing around them. This is expected in early traini
 Alternatively:
 1. `scalars` -> all gates positive and growing
 2. `block-profile` -> weight stds uniformly increasing
-3. `residual-contrib` -> blocks are mostly refining/transforming
+2. `residual-contrib` -> blocks are mostly refining/transforming
 
 This model is well-trained. Every block contributes, gradients flow well, and the
 model trusts its full depth.
@@ -526,8 +543,8 @@ RECOMMENDED AGENT DECISION TREES
 
 For general checkpoint debugging:
 
-    1. diagnose -> read verdict
-    2. If BROKEN/DEGRADED: follow action_plan.critical
+    1. tree -> discover layer names
+    2. scan -> flag layers with anomalies (ok/warning/critical)
     3. histogram on flagged layers -> understand distribution shape
     4. sparsity on flagged weight matrices -> find dead neurons
     5. compare-init -> check if issue is training-related or corruption
@@ -543,7 +560,7 @@ For understanding what the model is doing (the deep analysis):
 
 For transformer attention analysis:
 
-    1. diagnose -> check weight health first
+    1. scan -> check weight health first
     2. attention -> get per-head entropy and pattern classification
     3. For interesting heads: attention-plot for visualization
     4. residual-stream -> check information flow
