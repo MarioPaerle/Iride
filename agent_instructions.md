@@ -10,6 +10,30 @@ Never write python scripts to print raw tensors. Always use Iride to extract mat
 
 JSON Outputs: The CLI strictly outputs JSON. Parse the "data" field for the metrics, or the "suggested_fix" field if the "status" is "error".
 
+MUST — Plot Transparency Rule: whenever you generate or refer to a plot (attention-plot, mlp-usage-plot, or any future visualization command), you MUST state clearly, in the same chat turn that shows the plot to the human:
+
+  1. WHAT the plot shows, in one sentence (the axes and what the colour encodes).
+
+  2. The exact METRIC used, as pseudocode or a short formula. For example, for mlp-usage-plot with --metric contribution:
+         contribution[j] = mean_{b, l}( | activation(X W_up)[b, l, j] | ) * || W_down[:, j] ||_2
+     Do not hand-wave. If the metric has a threshold, state the threshold. If it depends on the activation function, state the activation.
+
+  3. The INPUT data used for the forward pass, and how representative it is of the real training distribution. Flag honestly:
+       - "random noise from --input-shape 1,128" -> say explicitly it is synthetic and may not match real usage patterns.
+       - "a single short --text prompt" -> say the batch is small and statistics are noisy.
+       - "real tokenised batch of size N, sequence L" -> say N and L and where the tokens came from.
+     If the data is NOT the training distribution, say so and flag that dead / super / contribution statistics may differ under real workload.
+
+  4. Any CAVEAT introduced by flags that affect the meaning. Examples:
+       - --no-w-down -> "contribution does not account for the W_down column norm, so a neuron that fires a lot but whose value column is near zero will still look important here."
+       - --activation identity on a non-fused MLP -> "the captured tensor is the raw W_up output (pre-activation), so 'firing' is defined on the linear score, not the post-activation value."
+       - --sort-by metric -> "columns are re-sorted per row; the x-axis is rank-by-usage, NOT the original neuron index."
+       - --max-cols stride-sampling -> "only every k-th neuron is drawn; small clusters may be aliased out."
+
+If the plot's underlying input was a random / synthetic batch, the human MUST be told in the chat, not just hidden in the JSON response. Silently using random data and presenting the plot as if it measured real model usage is a reporting bug.
+
+Prefer to embed the metric pseudocode and input description directly inside the HTML plot when the command supports it. When it does not, put the same information in the chat alongside the "open this in a browser" instruction.
+
 Workflow:
 - Start with `tree` to understand the architecture, then `scan` for bulk anomaly detection.
 - Drill down with `stats`, `svd`, `histogram`, or `sparsity` on flagged layers.
@@ -20,6 +44,8 @@ Workflow:
   and `residual-contrib` to measure actual block contributions during a forward pass.
   Read the "Interpretive Analysis Guide" section before using these.
 - For transformer models: use `attention` and `residual-stream` for dynamic analysis.
+- For MLP memory usage (dead neurons, superneurons, per-column contribution):
+  use `mlp-usage` for JSON stats or `mlp-usage-plot` for an HTML heatmap across all layers.
 - Use `run-forward` as a last resort if weights look fine but inference still fails.
 - Composable primitives (`slice`, `topk`, `cosine`, `reduce`, `matmul`) can be chained for custom analysis but cost more tokens. Only use them when the high-level commands don't answer your question.
 
@@ -217,6 +243,8 @@ Generates a self-contained HTML heatmap for a specific layer and head. Returns b
       --layer-idx 2 --head-idx 3
 
 Use `attention` first to identify interesting heads, then `attention-plot` to visualize them.
+
+IMPORTANT: obey the Plot Transparency Rule from the Core Rules section. When you hand this HTML to the human, also tell them in chat: what the heatmap shows (attention weights, rows = query positions, columns = key positions), the metric as pseudocode (softmax_j(Q_i K_j^T / sqrt(d_k)), with causal mask if is_causal), and the input (real tokens vs synthetic --input-shape, batch/seq size). If you used a random input, flag it.
 
 
 15. Dynamic Forward Pass Inspection (run-forward)
